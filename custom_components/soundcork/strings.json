@@ -1,0 +1,89 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to SoundCork",
+        "description": "Enter the URL of your SoundCork server.",
+        "data": {
+          "base_url": "SoundCork URL (e.g. http://192.168.1.229:8000)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to SoundCork. Check the URL and try again.",
+      "no_speakers": "Connected to SoundCork but no speakers were found.",
+      "unknown": "Unexpected error. Check logs for details."
+    },
+    "abort": {
+      "already_configured": "SoundCork is already configured."
+    }
+  },
+  "services": {
+    "play_preset": {
+      "name": "Play Preset",
+      "description": "Play a numbered preset (1-6) on a speaker.",
+      "fields": {
+        "entity_id": {
+          "name": "Speaker",
+          "description": "The SoundCork media player entity."
+        },
+        "preset": {
+          "name": "Preset Number",
+          "description": "Preset slot to play (1-6)."
+        }
+      }
+    },
+    "store_preset_tunein": {
+      "name": "Store TuneIn Preset",
+      "description": "Save a TuneIn station to a preset slot.",
+      "fields": {
+        "entity_id": {
+          "name": "Speaker",
+          "description": "The SoundCork media player entity."
+        },
+        "preset": {
+          "name": "Preset Number",
+          "description": "Preset slot to save to (1-6)."
+        },
+        "station_id": {
+          "name": "Station ID",
+          "description": "TuneIn station guide ID (e.g. s23452)."
+        },
+        "name": {
+          "name": "Station Name",
+          "description": "Display name for the preset."
+        },
+        "art_url": {
+          "name": "Artwork URL",
+          "description": "URL for the station logo (optional)."
+        }
+      }
+    },
+    "store_preset_radio": {
+      "name": "Store Internet Radio Preset",
+      "description": "Save a direct stream URL to a preset slot.",
+      "fields": {
+        "entity_id": {
+          "name": "Speaker",
+          "description": "The SoundCork media player entity."
+        },
+        "preset": {
+          "name": "Preset Number",
+          "description": "Preset slot to save to (1-6)."
+        },
+        "stream_url": {
+          "name": "Stream URL",
+          "description": "Direct audio stream URL."
+        },
+        "name": {
+          "name": "Station Name",
+          "description": "Display name for the preset."
+        },
+        "art_url": {
+          "name": "Artwork URL",
+          "description": "URL for the station logo (optional)."
+        }
+      }
+    }
+  }
+}
