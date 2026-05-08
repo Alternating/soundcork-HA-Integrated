@@ -17,6 +17,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._playing = null;
     this._message = null;
     this._initialized = false;
+    this._selectedSpeakerIdx = 0;
   }
 
   setConfig(config) {
@@ -105,12 +106,32 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (this._playing) return;
     this._playing = preset.id;
     this._render();
-    const xml = `<ContentItem source="${preset.source}" type="${preset.type}" location="${preset.location}" sourceAccount="${preset.sourceAccount||""}" isPresetable="true"></ContentItem>`;
-    await Promise.all(this._getSpeakerIps().map(ip =>
-      fetch(`${this._baseUrl}/api/v1/speakers/${ip}/select`, { method:"POST", headers:{"Content-Type":"application/xml"}, body:xml }).catch(()=>{})
-    ));
+    const ip = this._getSpeakerIps()[this._selectedSpeakerIdx];
+    if (ip) {
+      const xml = `<ContentItem source="${preset.source}" type="${preset.type}" location="${preset.location}" sourceAccount="${preset.sourceAccount||""}" isPresetable="true"></ContentItem>`;
+      await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/select`, {
+        method:"POST", headers:{"Content-Type":"application/xml"}, body:xml
+      }).catch(()=>{});
+    }
     this._playing = null;
     this._render();
+  }
+
+  async _playAll() {
+    const masterIp = this._getSpeakerIps()[0];
+    if (!masterIp) return;
+    try {
+      // Fetch all registered speakers from SoundCork
+      const resp = await fetch(`${this._baseUrl}/api/v1/speakers`);
+      const allSpeakers = await resp.json();
+      const allIps = allSpeakers.map(s => s.ipAddress).filter(Boolean);
+      if (allIps.length < 2) return;
+      await fetch(`${this._baseUrl}/api/v1/zone/create`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ master_ip: masterIp, ips: allIps })
+      });
+    } catch(e) { console.warn("SoundCork: playAll failed", e); }
   }
 
   async _turnOffAll() {
@@ -226,6 +247,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     .spk-track{font-size:12px;color:var(--secondary-text-color);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
     .spk-power{background:none;border:none;cursor:pointer;padding:6px;color:var(--secondary-text-color);font-size:22px;flex-shrink:0}
     .spk-power:hover{color:var(--primary-text-color)}
+    .play-all-btn{width:100%;padding:9px;border-radius:8px;border:none;background:rgba(3,169,244,.2);color:var(--primary-color,#03a9f4);font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:background .15s;margin-top:8px}
+    .play-all-btn:hover{background:rgba(3,169,244,.35)}
     .empty{text-align:center;padding:20px;color:var(--secondary-text-color);font-size:13px}
   `; }
 
@@ -252,6 +275,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         <input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="${volVal}" ${isOff ? "disabled" : ""}/>
         <span class="vol-val" id="vol-val">${volVal}%</span>
       </div>
+      ${!isOff ? `<button class="play-all-btn" id="play-all-btn">▶ Play All Speakers</button>` : ''}
     </div>`;
   }
 
@@ -268,12 +292,18 @@ class SoundcorkPresetEditor extends HTMLElement {
         const ip = this._getSpeakerIps()[0];
         if (ip) fetch(`${this._baseUrl}/api/v1/speakers/${ip}/power-${isOff ? "on" : "off"}`, {method:"POST"});
       });
+      this.shadowRoot.getElementById("play-all-btn")?.addEventListener("click", () => this._playAll());
       return;
     }
     const p = this._mode === "player";
     const presets = this._currentPresets;
     let body = "";
     if (p) {
+      const speakerChips = this._speakers.map((id, i) => {
+        const raw = this._hass?.states[id]?.attributes?.friendly_name || id;
+        const name = raw.replace(/ 2$/, '').replace(/_2$/, '');
+        return `<div class="chip ${this._selectedSpeakerIdx===i?'active':''}" data-spk="${i}">${name}</div>`;
+      }).join('');
       const grid = presets.map(pr => `
         <button class="preset-btn ${this._playing===pr.id?"playing":""}" data-id="${pr.id}">
           ${pr.art ? `<img src="${pr.art}" alt=""/>` : ""}
@@ -282,7 +312,7 @@ class SoundcorkPresetEditor extends HTMLElement {
           <span class="label">${pr.name}</span>
           ${this._playing===pr.id ? `<div class="spin">▶</div>` : ""}
         </button>`).join("");
-      body = `<div class="card"><h3>🎵 Presets</h3><div class="preset-grid">${grid}</div><div class="vol-row"><span class="vol-label">🔊</span><input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="30"/><span class="vol-val" id="vol-val">30%</span></div><button class="off-btn" id="off-btn">⏻ Turn Off All Speakers</button></div>`;
+      body = `<div class="card"><h3>🎵 Presets</h3><div class="chips">${speakerChips}</div><div class="preset-grid">${grid}</div><div class="vol-row"><span class="vol-label">🔊</span><input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="30"/><span class="vol-val" id="vol-val">30%</span></div><button class="off-btn" id="off-btn">⏻ Turn Off All Speakers</button></div>`;
     } else {
       const chips = presets.length ? presets.map(pr => `<div class="chip ${this._selectedSlot===pr.id?"active":""}" data-slot="${pr.id}">${pr.art?`<img src="${pr.art}" alt=""/>`:""}  <span>${pr.id}. ${pr.name}</span></div>`).join("") : Array.from({length:6},(_,i)=>`<div class="chip ${this._selectedSlot===i+1?"active":""}" data-slot="${i+1}"><span>${i+1}. —</span></div>`).join("");
       const results = this._loading ? `<div class="loading">Searching TuneIn…</div>` : this._searchResults.length ? this._searchResults.map(r=>`
@@ -299,6 +329,9 @@ class SoundcorkPresetEditor extends HTMLElement {
     }
     this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card>${body}</ha-card>`;
     if (p) {
+      this.shadowRoot.querySelectorAll(".chip[data-spk]").forEach(c =>
+        c.addEventListener("click", () => { this._selectedSpeakerIdx = parseInt(c.dataset.spk); this._render(); })
+      );
       this.shadowRoot.querySelectorAll(".preset-btn").forEach(b => b.addEventListener("click", () => { const pr = this._currentPresets.find(x=>x.id===parseInt(b.dataset.id)); if(pr) this._playPreset(pr); }));
       this.shadowRoot.getElementById("off-btn")?.addEventListener("click", () => this._turnOffAll());
       const vs = this.shadowRoot.getElementById("vol-slider");
@@ -315,7 +348,7 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   getCardSize() { return this._mode==="player" ? 5 : 4; }
-  static getStubConfig() { return { soundcork_url:"http://YOUR_SOUNDCORK_IP:8000", mode:"player", speakers:[] }; }
+  static getStubConfig() { return { soundcork_url:"http://192.168.1.229:8000", mode:"player", speakers:[] }; }
 }
 
 customElements.define("soundcork-preset-editor", SoundcorkPresetEditor);
