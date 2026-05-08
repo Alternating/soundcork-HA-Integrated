@@ -315,7 +315,7 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   getCardSize() { return this._mode==="player" ? 5 : 4; }
-  static getStubConfig() { return { soundcork_url:"http://192.168.1.229:8000", mode:"player", speakers:[] }; }
+  static getStubConfig() { return { soundcork_url:"http://YOUR_SOUNDCORK_IP:8000", mode:"player", speakers:[] }; }
 }
 
 customElements.define("soundcork-preset-editor", SoundcorkPresetEditor);
