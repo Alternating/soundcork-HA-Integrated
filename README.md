@@ -1,5 +1,7 @@
 # SoundCork + Home Assistant Integration
 
+📖 **[Complete Setup Guide →](docs/SETUP.md)**
+
 ![SoundCork Dashboard](https://i.imgur.com/JXOhtDM.png)
 
 A patched version of [SoundCork](https://github.com/timvw/soundcork) with full Home Assistant integration, enabling control of Bose SoundTouch speakers after the Bose cloud shutdown.
