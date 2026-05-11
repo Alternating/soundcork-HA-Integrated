@@ -1857,3 +1857,183 @@ async def api_get_sources(ip: str):
         raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
     except _httpx.TimeoutException:
         raise HTTPException(status_code=504, detail=f"Speaker at {ip} timed out")
+
+# ---------------------------------------------------------------------------
+# Recents
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/speakers/{ip}/recents", tags=["soundcork-api"])
+async def api_get_recents(ip: str):
+    """Get recently played items from a speaker."""
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            r = await client.get(_speaker_url(ip, "/recents"))
+            return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
+    except _httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
+    except _httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Speaker at {ip} timed out")
+
+
+# ---------------------------------------------------------------------------
+# Pandora station discovery
+# Reads SoundCork stored Recents.xml (all-time history) rather than
+# the live speaker recents endpoint (limited recent buffer).
+# Returns deduplicated Pandora stations across all known accounts.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/pandora/stations", tags=["soundcork-api"])
+async def api_pandora_stations():
+    """
+    Return all unique Pandora stations from both:
+    1. SoundCork stored Recents.xml files (historical)
+    2. Live recents from all registered speakers (most recent plays)
+    Merges and deduplicates by location ID.
+    """
+    import glob
+    import xml.etree.ElementTree as _ET
+
+    stations: dict = {}  # key: location, value: station dict
+
+    def _parse_recents_xml(xml_text: str) -> None:
+        try:
+            root = _ET.fromstring(xml_text)
+            for recent in root.findall("recent"):
+                ci = recent.find("contentItem")
+                if ci is None:
+                    continue
+                if ci.attrib.get("source") != "PANDORA":
+                    continue
+                location = ci.attrib.get("location", "")
+                if not location:
+                    continue
+                name_elem = ci.find("itemName")
+                art_elem = ci.find("containerArt")
+                name = name_elem.text if name_elem is not None and name_elem.text else ""
+                art = art_elem.text if art_elem is not None and art_elem.text else ""
+                # Only add if not seen, or if this entry has better data (name/art)
+                if location not in stations or (not stations[location]["name"] and name):
+                    stations[location] = {
+                        "name": name or "Pandora Station",
+                        "art": art,
+                        "location": location,
+                        "sourceAccount": ci.attrib.get("sourceAccount", ""),
+                    }
+                elif location in stations and not stations[location]["art"] and art:
+                    stations[location]["art"] = art
+        except Exception as e:
+            logger.debug("Failed to parse recents XML: %s", e)
+
+    # 1. Load from SoundCork stored Recents.xml files
+    pattern = os.path.join(settings.data_dir, "*/Recents.xml")
+    for recents_path in glob.glob(pattern):
+        try:
+            with open(recents_path, "r", encoding="utf-8", errors="ignore") as f:
+                _parse_recents_xml(f.read())
+        except Exception as e:
+            logger.warning("Failed to read recents file %s: %s", recents_path, e)
+
+    # 2. Fetch live recents from all registered speakers
+    speakers = _speakers_from_file()
+    async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+        for speaker in speakers:
+            ip = speaker.get("ipAddress", "")
+            if not ip:
+                continue
+            try:
+                r = await client.get(_speaker_url(ip, "/recents"))
+                _parse_recents_xml(r.text)
+            except Exception as e:
+                logger.debug("Failed to fetch live recents from %s: %s", ip, e)
+
+    # Group by account
+    by_account: dict = {}
+    for station in stations.values():
+        acct = station["sourceAccount"]
+        if acct not in by_account:
+            by_account[acct] = []
+        by_account[acct].append(station)
+
+    return {"stations": list(stations.values()), "by_account": by_account}
+
+
+# ---------------------------------------------------------------------------
+# Zone management
+# Create/clear Bose speaker zones for synchronized multi-room playback
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/zone/set", tags=["soundcork-api"])
+async def api_zone_set(request: Request):
+    """
+    Create a speaker zone for synchronized playback.
+    The first speaker becomes master; others become slaves.
+    Body JSON:
+    {
+      "master_ip": "192.168.1.228",
+      "master_device_id": "A0F6FD743B41",
+      "slaves": [
+        {"ip": "192.168.1.41", "device_id": "587A6274B5C4"},
+        ...
+      ]
+    }
+    """
+    body = await request.json()
+    master_ip = body["master_ip"]
+    master_device_id = body["master_device_id"]
+    slaves = body.get("slaves", [])
+
+    members = "".join(
+        f'<member ipaddress="{s["ip"]}">{s["device_id"]}</member>'
+        for s in slaves
+    )
+    zone_xml = (
+        f'<zone master="{master_device_id}" senderIPAddress="{master_ip}">'
+        f"{members}"
+        f"</zone>"
+    )
+
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            r = await client.post(
+                _speaker_url(master_ip, "/setZone"),
+                content=zone_xml.encode(),
+                headers={"Content-Type": "application/xml"},
+            )
+            return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
+    except _httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach master speaker at {master_ip}")
+    except _httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Master speaker at {master_ip} timed out")
+
+
+@app.post("/api/v1/zone/clear/{ip}", tags=["soundcork-api"])
+async def api_zone_clear(ip: str):
+    """
+    Clear/dissolve the zone on a master speaker.
+    Sends setZone with no members, returning the speaker to standalone mode.
+    Requires the device_id query parameter.
+    """
+    # Fetch device ID from stored DeviceInfo
+    device_id = None
+    for speaker in _speakers_from_file():
+        if speaker.get("ipAddress") == ip:
+            device_id = speaker.get("deviceId")
+            break
+
+    if not device_id:
+        raise HTTPException(status_code=404, detail=f"Speaker {ip} not found in registry")
+
+    zone_xml = f'<zone master="{device_id}" senderIPAddress="{ip}"></zone>'
+
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            r = await client.post(
+                _speaker_url(ip, "/setZone"),
+                content=zone_xml.encode(),
+                headers={"Content-Type": "application/xml"},
+            )
+            return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
+    except _httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
+    except _httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Speaker at {ip} timed out")
