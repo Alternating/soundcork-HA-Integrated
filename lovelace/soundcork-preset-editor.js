@@ -15,6 +15,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._loading = false;
     this._saving = false;
     this._playing = null;
+    this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
   }
@@ -99,11 +100,29 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._playing = preset.id;
     this._render();
     const xml = `<ContentItem source="${preset.source}" type="${preset.type}" location="${preset.location}" sourceAccount="${preset.sourceAccount||""}" isPresetable="true"></ContentItem>`;
-    await Promise.all(this._getSpeakerIps().map(ip =>
+    const ips = this._getTargetIps();
+    await Promise.all(ips.map(ip =>
       fetch(`${this._baseUrl}/api/v1/speakers/${ip}/select`, { method:"POST", headers:{"Content-Type":"application/xml"}, body:xml }).catch(()=>{})
     ));
     this._playing = null;
     this._render();
+  }
+
+  _getTargetIps() {
+    // If a subset of speakers is selected, use those; otherwise use all
+    if (this._selectedSpeakers && this._selectedSpeakers.length > 0) {
+      return this._selectedSpeakers
+        .map(id => this._hass && this._hass.states[id] && this._hass.states[id].attributes.ip_address)
+        .filter(Boolean);
+    }
+    return this._getSpeakerIps();
+  }
+
+  _getSpeakerNames() {
+    return this._speakers.map(id => {
+      const state = this._hass && this._hass.states[id];
+      return { id, name: state ? (state.attributes.friendly_name || id.split(".")[1]) : id.split(".")[1] };
+    });
   }
 
   async _turnOffAll() {
@@ -168,6 +187,11 @@ class SoundcorkPresetEditor extends HTMLElement {
     ha-card{background:var(--card-background-color);border-radius:12px;overflow:hidden}
     .card{padding:16px}
     h3{margin:0 0 14px;font-size:12px;font-weight:700;color:var(--secondary-text-color);text-transform:uppercase;letter-spacing:.1em}
+    .spk-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+    .spk-chip{padding:4px 12px;border-radius:20px;border:1.5px solid transparent;cursor:pointer;font-size:12px;font-weight:600;color:var(--primary-text-color);background:var(--secondary-background-color,#2a2a40);transition:border-color .15s,background .15s}
+    .spk-chip.active{border-color:var(--primary-color);background:rgba(3,169,244,.15);color:var(--primary-color)}
+    .spk-chip:hover:not(.active){border-color:rgba(255,255,255,.2)}
+    .spk-chip-all{background:rgba(3,169,244,.1)}
     .preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
     .preset-btn{position:relative;height:100px;border-radius:10px;overflow:hidden;cursor:pointer;border:none;padding:0;background:#333;transition:transform .12s,opacity .12s;width:100%}
     .preset-btn:active{transform:scale(.97)}
@@ -295,6 +319,24 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (p) {
       this.shadowRoot.querySelectorAll(".preset-btn").forEach(b => b.addEventListener("click", () => { const pr = this._currentPresets.find(x=>x.id===parseInt(b.dataset.id)); if(pr) this._playPreset(pr); }));
       this.shadowRoot.getElementById("off-btn")?.addEventListener("click", () => this._turnOffAll());
+      this.shadowRoot.querySelectorAll(".spk-chip").forEach(chip => {
+        chip.addEventListener("click", () => {
+          const spk = chip.dataset.spk;
+          if (spk === "all") {
+            this._selectedSpeakers = null;
+          } else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) {
+              this._selectedSpeakers.splice(idx, 1);
+              if (this._selectedSpeakers.length === 0) this._selectedSpeakers = null;
+            } else {
+              this._selectedSpeakers.push(spk);
+            }
+          }
+          this._render();
+        });
+      });
       const vs = this.shadowRoot.getElementById("vol-slider");
       const vv = this.shadowRoot.getElementById("vol-val");
       vs?.addEventListener("input", () => { vv.textContent = vs.value + "%"; });
