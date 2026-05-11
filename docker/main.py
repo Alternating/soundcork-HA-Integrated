@@ -184,7 +184,7 @@ async def log_unknown_requests(request: Request, call_next):
     """Log unknown endpoints (404s) for API research.
 
     When LOG_REQUEST_BODY / LOG_REQUEST_HEADERS are enabled, body and
-    headers are included in the log line — but only for 404s.  Known
+    headers are included in the log line -- but only for 404s.  Known
     endpoints are not logged here (they have their own logging).
     """
     body = b""
@@ -342,7 +342,7 @@ async def scmudc_telemetry(device_id: str, request: Request):
 
     The speaker posts real-time events here: power state changes,
     playback state, volume changes, source switches, art updates, etc.
-    This is Bose's analytics/telemetry endpoint — equivalent to
+    This is Bose's analytics/telemetry endpoint -- equivalent to
     POST /v1/stapp/{deviceId} used by the mobile app (Stockholm).
 
     The speaker sends events regardless of whether the server accepts
@@ -369,7 +369,7 @@ async def scmudc_telemetry(device_id: str, request: Request):
     status_code=HTTPStatus.OK,
 )
 async def stapp_telemetry(device_id: str, request: Request):
-    """SoundTouch app analytics — equivalent to scmudc but used by the mobile app.
+    """SoundTouch app analytics -- equivalent to scmudc but used by the mobile app.
 
     Request format: same JSON envelope/payload as scmudc (already documented in #200).
     Response: bare 200 OK, no body.  Fire-and-forget.
@@ -387,7 +387,7 @@ async def stapp_telemetry(device_id: str, request: Request):
 async def streaming_stats_usage(request: Request):
     """Device usage statistics (play time, source stats, etc.).
 
-    Real server (streaming.bose.com) still alive — returns 400 "Invalid
+    Real server (streaming.bose.com) still alive -- returns 400 "Invalid
     version in header(SOf)" without proper headers.  Request format is
     XML or JSON with deviceId, accountId, timestamp, eventType, parameters.
     Response: bare 200 OK, no body.
@@ -441,7 +441,7 @@ async def streaming_stats_error(request: Request):
 async def bmx_tunein_report(request: Request):
     """TuneIn playback reporting (listen time, station stats).
 
-    Real server (content.api.bose.io) still alive — returns 403
+    Real server (content.api.bose.io) still alive -- returns 403
     "Invalid client id".  Request format unknown.
 
     Logging enabled to capture actual speaker payloads.
@@ -464,7 +464,7 @@ async def bmx_tunein_report(request: Request):
 #
 # Response format aligned with gesellix/Bose-SoundTouch Go implementation:
 # root element <customer>, Content-Type: application/xml.
-# Real Bose server (streaming.bose.com) still returns 406 with ETag —
+# Real Bose server (streaming.bose.com) still returns 406 with ETag --
 # alive but wants a specific Accept header.
 ##############################################################################
 
@@ -498,7 +498,7 @@ def customer_account_profile(account: str):
     status_code=HTTPStatus.OK,
 )
 async def update_customer_account_profile(account: str, request: Request):
-    """Accept account profile update.  Request format unknown — logging."""
+    """Accept account profile update.  Request format unknown -- logging."""
     body = await request.body()
     if body:
         content_type = request.headers.get("content-type", "")
@@ -519,7 +519,7 @@ async def update_customer_account_profile(account: str, request: Request):
     status_code=HTTPStatus.OK,
 )
 async def change_customer_password(account: str, request: Request):
-    """Accept password change.  Request format unknown — logging."""
+    """Accept password change.  Request format unknown -- logging."""
     body = await request.body()
     if body:
         content_type = request.headers.get("content-type", "")
@@ -590,7 +590,7 @@ def get_device_settings(account: str, device: str):
     status_code=HTTPStatus.OK,
 )
 async def update_device_settings(account: str, device: str, request: Request):
-    """Accept device settings update.  Request format unknown — logging."""
+    """Accept device settings update.  Request format unknown -- logging."""
     body = await request.body()
     if body:
         content_type = request.headers.get("content-type", "")
@@ -639,7 +639,7 @@ def oauth_token_refresh(device_id: str, provider_id: str, token_type: str):
     token = spotify_service.get_fresh_token_sync()
     if not token:
         logger.warning(
-            "OAuth token refresh failed — no Spotify token available (device=%s)",
+            "OAuth token refresh failed -- no Spotify token available (device=%s)",
             device_id,
         )
         return JSONResponse(
@@ -1245,7 +1245,7 @@ def custom_stream_playback(request: Request) -> BmxPlaybackResponse:
     return play_custom_stream(data)
 
 
-# BMX Orion alias — Go registers this as POST, device may use GET or POST
+# BMX Orion alias -- Go registers this as POST, device may use GET or POST
 @app.post("/bmx/orion/v1/playback/station/{data}", tags=["bmx"])
 @app.get("/bmx/orion/v1/playback/station/{data}", tags=["bmx"])
 def bmx_orion_playback(data: str) -> BmxPlaybackResponse:
@@ -1281,7 +1281,7 @@ def bose_xml_str(xml: ET.Element) -> str:
 ##############################################################################
 # Root-level aliases (without /marge or /bmx prefix)
 #
-# The Go implementation registers every marge/bmx endpoint twice — once
+# The Go implementation registers every marge/bmx endpoint twice -- once
 # under the prefix and once at the root.  This supports direct-domain
 # calls where the speaker hits streaming.bose.com/accounts/... without
 # the /marge path segment.
@@ -1582,6 +1582,7 @@ def bmx_services_availability():
 </serviceAvailability>'''
     return Response(content=xml, media_type="application/xml")
 #####################################################################################
+#####################################################################################
 # SoundCork Native API - Phase 1
 # Unauthenticated REST endpoints for Home Assistant integration
 # Proxies speaker commands through SoundCork without requiring session auth
@@ -1607,6 +1608,15 @@ def _speakers_from_file() -> list:
             return _json.load(f)
     except Exception:
         return []
+
+
+async def _key_press(client: _httpx.AsyncClient, ip: str, key: str) -> _httpx.Response:
+    """Send a key press followed by a key release as required by the Bose API spec."""
+    headers = {"Content-Type": "application/xml"}
+    press = f'<key state="press" sender="Gabbo">{key}</key>'.encode()
+    release = f'<key state="release" sender="Gabbo">{key}</key>'.encode()
+    await client.post(_speaker_url(ip, "/key"), content=press, headers=headers)
+    return await client.post(_speaker_url(ip, "/key"), content=release, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -1657,14 +1667,7 @@ async def api_get_presets(ip: str):
 async def api_store_preset(ip: str, request: Request):
     """
     Store a preset on a speaker.
-    Body should be XML ContentItem wrapped in a preset element, e.g.:
-    <preset id="1">
-      <ContentItem source="TUNEIN" type="stationurl"
-        location="/v1/playback/station/s23452" isPresetable="true">
-        <itemName>WUWM</itemName>
-        <containerArt>http://...</containerArt>
-      </ContentItem>
-    </preset>
+    Body: <preset id="1"><ContentItem source="TUNEIN" ...>...</ContentItem></preset>
     """
     body = await request.body()
     try:
@@ -1689,10 +1692,7 @@ async def api_store_preset(ip: str, request: Request):
 async def api_select(ip: str, request: Request):
     """
     Play a content item on a speaker.
-    Body should be a ContentItem XML element, e.g.:
-    <ContentItem source="TUNEIN" type="stationurl"
-      location="/v1/playback/station/s23452" sourceAccount="" isPresetable="true">
-    </ContentItem>
+    Body: <ContentItem source="TUNEIN" type="stationurl" location="..." isPresetable="true"></ContentItem>
     """
     body = await request.body()
     try:
@@ -1728,10 +1728,7 @@ async def api_get_volume(ip: str):
 
 @app.post("/api/v1/speakers/{ip}/volume", tags=["soundcork-api"])
 async def api_set_volume(ip: str, request: Request):
-    """
-    Set volume on a speaker.
-    Body: <volume>25</volume>
-    """
+    """Set volume on a speaker. Body: <volume>25</volume>"""
     body = await request.body()
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
@@ -1753,18 +1750,10 @@ async def api_set_volume(ip: str, request: Request):
 
 @app.post("/api/v1/speakers/{ip}/power", tags=["soundcork-api"])
 async def api_power(ip: str):
-    """
-    Toggle power on a speaker (press POWER key).
-    Use /api/v1/speakers/{ip}/power-on or power-off for explicit state.
-    """
-    body = b'<key state="press" sender="Gabbo">POWER</key>'
+    """Toggle power on a speaker (press + release POWER key)."""
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
-            r = await client.post(
-                _speaker_url(ip, "/key"),
-                content=body,
-                headers={"Content-Type": "application/xml"},
-            )
+            r = await _key_press(client, ip, "POWER")
             return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
     except _httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
@@ -1774,20 +1763,13 @@ async def api_power(ip: str):
 
 @app.post("/api/v1/speakers/{ip}/power-on", tags=["soundcork-api"])
 async def api_power_on(ip: str):
-    """Power on a speaker by checking state first, only pressing key if currently off."""
+    """Power on a speaker -- only sends key if currently in STANDBY."""
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
-            # Check current state
             r = await client.get(_speaker_url(ip, "/nowPlaying"))
             xml = ET.fromstring(r.content)
-            source = xml.attrib.get("source", "")
-            if source == "STANDBY":
-                body = b'<key state="press" sender="Gabbo">POWER</key>'
-                r = await client.post(
-                    _speaker_url(ip, "/key"),
-                    content=body,
-                    headers={"Content-Type": "application/xml"},
-                )
+            if xml.attrib.get("source", "") == "STANDBY":
+                r = await _key_press(client, ip, "POWER")
             return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
     except _httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
@@ -1797,19 +1779,34 @@ async def api_power_on(ip: str):
 
 @app.post("/api/v1/speakers/{ip}/power-off", tags=["soundcork-api"])
 async def api_power_off(ip: str):
-    """Power off a speaker by checking state first, only pressing key if currently on."""
+    """Power off a speaker -- only sends key if not already in STANDBY."""
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
             r = await client.get(_speaker_url(ip, "/nowPlaying"))
             xml = ET.fromstring(r.content)
-            source = xml.attrib.get("source", "")
-            if source != "STANDBY":
-                body = b'<key state="press" sender="Gabbo">POWER</key>'
-                r = await client.post(
-                    _speaker_url(ip, "/key"),
-                    content=body,
-                    headers={"Content-Type": "application/xml"},
-                )
+            if xml.attrib.get("source", "") != "STANDBY":
+                r = await _key_press(client, ip, "POWER")
+            return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
+    except _httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
+    except _httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Speaker at {ip} timed out")
+
+
+# ---------------------------------------------------------------------------
+# Generic key endpoint (press + release)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/speakers/{ip}/key/{key_value}", tags=["soundcork-api"])
+async def api_key(ip: str, key_value: str):
+    """
+    Send a key press + release to a speaker.
+    Valid values: PLAY, PAUSE, STOP, POWER, MUTE, VOLUME_UP, VOLUME_DOWN,
+    PREV_TRACK, NEXT_TRACK, PRESET_1 through PRESET_6, etc.
+    """
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            r = await _key_press(client, ip, key_value.upper())
             return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
     except _httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
@@ -1823,10 +1820,7 @@ async def api_power_off(ip: str):
 
 @app.get("/api/v1/tunein/search", tags=["soundcork-api"])
 async def api_tunein_search(q: str):
-    """
-    Search TuneIn for radio stations.
-    Returns OPML XML from radiotime.com.
-    """
+    """Search TuneIn -- returns stations and podcasts."""
     url = f"https://opml.radiotime.com/search.ashx?query={q}&render=json&include=podcasts"
     try:
         async with _httpx.AsyncClient(timeout=10.0) as client:
@@ -1838,9 +1832,7 @@ async def api_tunein_search(q: str):
 
 @app.get("/api/v1/tunein/describe", tags=["soundcork-api"])
 async def api_tunein_describe(id: str):
-    """
-    Get details for a specific TuneIn station by guide ID (e.g. s23452).
-    """
+    """Get details for a specific TuneIn station/podcast by guide ID (e.g. s23452)."""
     url = f"https://opml.radiotime.com/describe.ashx?id={id}&render=json"
     try:
         async with _httpx.AsyncClient(timeout=10.0) as client:

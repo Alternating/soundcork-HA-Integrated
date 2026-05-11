@@ -286,13 +286,11 @@ class SoundCorkMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         await self.coordinator.async_request_refresh()
 
     async def async_mute_volume(self, mute: bool) -> None:
-        """Mute or unmute by sending the MUTE key."""
-        body = b'<key state="press" sender="Gabbo">MUTE</key>'
-        await self._post(
-            f"/api/v1/speakers/{self._ip}/key",
-            data=body,
-            content_type="application/xml",
-        )
+        """Mute or unmute by sending the MUTE key (press + release per Bose API spec)."""
+        press = b'<key state="press" sender="Gabbo">MUTE</key>'
+        release = b'<key state="release" sender="Gabbo">MUTE</key>'
+        await self._post(f"/api/v1/speakers/{self._ip}/key", data=press, content_type="application/xml")
+        await self._post(f"/api/v1/speakers/{self._ip}/key", data=release, content_type="application/xml")
         await self.coordinator.async_request_refresh()
 
     async def async_select_source(self, source: str) -> None:

@@ -5,7 +5,7 @@ DOMAIN = "soundcork"
 CONF_BASE_URL = "base_url"
 
 # Polling interval in seconds
-SCAN_INTERVAL_SECONDS = 10
+SCAN_INTERVAL_SECONDS = 30
 
 # Speaker data keys
 ATTR_IP_ADDRESS = "ip_address"

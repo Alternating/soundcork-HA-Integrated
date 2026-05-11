@@ -191,15 +191,10 @@ class SoundCorkCoordinator(DataUpdateCoordinator):
             if not self.speakers:
                 self.speakers = await self._fetch_speakers()
 
+            import asyncio
             data: dict[str, Any] = {}
             for speaker in self.speakers:
                 ip = speaker["ipAddress"]
-                now_playing, volume, presets = await self.hass.async_add_executor_job(
-                    lambda _ip=ip: None  # placeholder - will use async below
-                ) or (None, None, None)
-
-                # Fetch concurrently
-                import asyncio
                 now_playing, volume, presets = await asyncio.gather(
                     self._fetch_now_playing(ip),
                     self._fetch_volume(ip),
