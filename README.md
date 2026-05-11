@@ -1,98 +1,133 @@
 # SoundCork + Home Assistant Integration
 
-📖 **[Complete Setup Guide →](docs/SETUP.md)**
+Self-hosted Bose SoundTouch cloud replacement with native Home Assistant integration.
 
 ![SoundCork Dashboard](docs/ha-dashboard.png)
 
-A patched version of [SoundCork](https://github.com/timvw/soundcork) with full Home Assistant integration, enabling control of Bose SoundTouch speakers after the Bose cloud shutdown.
+Extends [SoundCork](https://github.com/timvw/soundcork) with:
+- REST API patch for Home Assistant control
+- Custom HA integration (custom_components/soundcork)
+- Custom Lovelace card with preset player, TuneIn search, per-speaker volume
 
-## What This Adds
+## Repository Structure
 
-**SoundCork Patches (`docker/main.py`)**
-- `serviceAvailability` stub endpoints to keep speakers online
-- REST API endpoints for Home Assistant integration (`/api/v1/speakers/*`)
-- TuneIn podcast search support (`include=podcasts`)
-- Podcast show ID resolution — automatically plays latest episode
-- Pre-resolves redirect chains so SoundTouch hardware can stream podcasts
+```
+soundcork-server/     - Patched main.py and Dockerfile
+ha-integration/       - HA custom integration
+lovelace-card/        - Custom Lovelace card
+speaker-config/       - Speaker redirect config template
+docs/                 - Deployment and setup guides
+```
 
-**SoundCork Web UI (`docker/app.js`)**
-- Podcast results shown alongside stations in TuneIn search
-- Podcast badge indicator in search results
+## Quick Start
 
-**Home Assistant Custom Integration (`custom_components/soundcork/`)**
-- Native HA integration with config flow
-- One `media_player` entity per speaker
-- Polls now-playing, volume, and presets every 10 seconds
-- Services: `play_preset`, `store_preset_tunein`, `store_preset_radio`
-
-**Lovelace Card (`lovelace/soundcork-preset-editor.js`)**
-- `mode: player` — dynamic preset grid with artwork, plays all speakers
-- `mode: speaker` — individual speaker card with artwork, volume, power
-- `mode: editor` — TuneIn search supporting stations and podcasts
-
-## Requirements
-
-- Docker (tested on Proxmox LXC)
-- Home Assistant with HACS
-- Bose SoundTouch speakers on local network
-
-## Setup
-
-### 1. Deploy SoundCork Docker Container
+### 1. Deploy SoundCork
 
 ```bash
-docker build -t soundcork-local:latest ./docker
-
-docker run -d \
-  --name soundcork \
-  --restart unless-stopped \
-  -p 8000:8000 \
-  -v /soundcork/data:/soundcork/data \
+cd soundcork-server
+docker build -t soundcork-local:latest .
+docker run -d --name soundcork --restart unless-stopped \
+  -p 8000:8000 -v /your/data/dir:/soundcork/data \
   -e base_url=http://YOUR_SERVER_IP:8000 \
   -e data_dir=/soundcork/data \
   -e MGMT_PASSWORD=your_password \
   soundcork-local:latest
 ```
 
-### 2. Point Speakers at SoundCork
+### 2. Configure Each Speaker
 
-Each Bose SoundTouch speaker must have its DNS overridden to point `*.bose.com` and `*.bosetm.com` to your SoundCork server IP. Configure this in your router/DNS server.
+SSH into each speaker (first time: create empty file called remote_services on a FAT32 USB):
 
-### 3. Install Home Assistant Integration
+```bash
+ssh -o HostKeyAlgorithms=+ssh-rsa,ssh-dss -o PubkeyAcceptedKeyTypes=+ssh-rsa,ssh-dss root@SPEAKER_IP
+rw
+cat speaker-config/SoundTouchSdkPrivateCfg.xml > /opt/Bose/etc/SoundTouchSdkPrivateCfg.xml
+touch /mnt/nv/remote_services
+reboot
+```
 
-Copy `custom_components/soundcork/` to your HA `/config/custom_components/` directory, then restart HA and add the integration via Settings → Integrations → Add → SoundCork.
+Or push to all speakers at once from your server:
 
-### 4. Install Lovelace Card
+```bash
+for ip in 192.168.1.X 192.168.1.Y; do
+  cat speaker-config/SoundTouchSdkPrivateCfg.xml | \
+    ssh -o HostKeyAlgorithms=ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa root@$ip \
+    "cat > /opt/Bose/etc/SoundTouchSdkPrivateCfg.xml && touch /mnt/nv/remote_services"
+  ssh -o HostKeyAlgorithms=ssh-rsa -o PubkeyAcceptedKeyTypes=ssh-rsa root@$ip reboot
+done
+```
 
-Copy `lovelace/soundcork-preset-editor.js` to `/config/www/` on your HA server and register it as a dashboard resource.
+Edit speaker-config/SoundTouchSdkPrivateCfg.xml and replace YOUR_SERVER_IP first.
 
-## Dashboard Card Configuration
+### 3. Install the HA Integration
+
+```bash
+cp -r ha-integration/custom_components/soundcork /config/custom_components/
+```
+
+Restart HA, then Settings > Integrations > Add > SoundCork, enter your SoundCork URL.
+
+### 4. Install the Lovelace Card
+
+```bash
+cp lovelace-card/soundcork-preset-editor.js /config/www/
+```
+
+Settings > Dashboards > Resources > Add: /local/soundcork-preset-editor.js (JS Module)
+
+## HA Integration Features
+
+- One media_player entity per speaker
+- Real-time state via WebSocket (port 8080) + 30s REST poll fallback
+- Volume, power, preset selection, now playing with artwork
+- Custom services: soundcork.play_preset, soundcork.store_preset_tunein, soundcork.store_preset_radio
+
+## Lovelace Card Modes
 
 ```yaml
-# Preset player (all speakers)
+# Preset player with speaker selector
 type: custom:soundcork-preset-editor
-soundcork_url: http://YOUR_SERVER_IP:8000
 mode: player
+soundcork_url: http://192.168.1.229:8000
 speakers:
-  - media_player.your_speaker_1
-  - media_player.your_speaker_2
+  - media_player.speaker_1
+  - media_player.speaker_2
 
-# Individual speaker card
+# Per-speaker card with volume slider
 type: custom:soundcork-preset-editor
-soundcork_url: http://YOUR_SERVER_IP:8000
 mode: speaker
-speaker_name: Living Room
+soundcork_url: http://192.168.1.229:8000
+speaker_name: The Deck
 speakers:
-  - media_player.living_room
+  - media_player.the_deck
 
-# TuneIn preset editor
+# TuneIn search and preset editor
 type: custom:soundcork-preset-editor
-soundcork_url: http://YOUR_SERVER_IP:8000
 mode: editor
+soundcork_url: http://192.168.1.229:8000
 speakers:
-  - media_player.your_speaker_1
+  - media_player.speaker_1
 ```
+
+## API Additions
+
+The main.py patch adds unauthenticated endpoints:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| /api/v1/speakers | GET | List speakers |
+| /api/v1/speakers/{ip}/now-playing | GET | Now playing |
+| /api/v1/speakers/{ip}/volume | GET/POST | Volume |
+| /api/v1/speakers/{ip}/presets | GET | Presets |
+| /api/v1/speakers/{ip}/store-preset | POST | Save preset |
+| /api/v1/speakers/{ip}/select | POST | Play content |
+| /api/v1/speakers/{ip}/power-on | POST | Power on |
+| /api/v1/speakers/{ip}/power-off | POST | Power off |
+| /api/v1/speakers/{ip}/key/{key} | POST | Key press+release |
+| /api/v1/tunein/search | GET | Search TuneIn |
+| /api/v1/tunein/describe | GET | Station details |
 
 ## Credits
 
-Built on top of [SoundCork](https://github.com/timvw/soundcork) by timvw.
+- [SoundCork](https://github.com/timvw/soundcork) by timvw
+- Bose SoundTouch Web API documentation

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SoundTouchSdkPrivateCfg>
+  <margeServerUrl>http://YOUR_SOUNDCORK_IP:8000</margeServerUrl>
+  <statsServerUrl>http://YOUR_SOUNDCORK_IP:8000</statsServerUrl>
+  <swUpdateUrl>http://YOUR_SOUNDCORK_IP:8000</swUpdateUrl>
+  <usePandoraProductionServer>true</usePandoraProductionServer>
+  <isZeroconfEnabled>true</isZeroconfEnabled>
+  <saveMargeCustomerReport>false</saveMargeCustomerReport>
+  <bmxRegistryUrl>http://YOUR_SOUNDCORK_IP:8000/bmx/registry/v1/services</bmxRegistryUrl>
+</SoundTouchSdkPrivateCfg>

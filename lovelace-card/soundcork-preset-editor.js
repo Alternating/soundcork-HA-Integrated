@@ -1,7 +1,7 @@
 /**
  * SoundCork Card - Custom Lovelace Card
- * mode: player → dynamic preset play buttons loaded live from SoundCork
- * mode: editor → TuneIn search to update preset slots
+ * mode: player ? dynamic preset play buttons loaded live from SoundCork
+ * mode: editor ? TuneIn search to update preset slots
  */
 class SoundcorkPresetEditor extends HTMLElement {
   constructor() {
@@ -15,6 +15,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._loading = false;
     this._saving = false;
     this._playing = null;
+    this._selectedSpeakers = null;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -131,6 +132,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     ));
   }
 
+  _getTargetIps() {
+    if (this._selectedSpeakers && this._selectedSpeakers.length > 0) {
+      return this._selectedSpeakers.map(id => this._hass && this._hass.states[id] && this._hass.states[id].attributes.ip_address).filter(Boolean);
+    }
+    return this._getSpeakerIps();
+  }
+
+  _getSpeakerNames() {
+    return this._speakers.map(id => {
+      const state = this._hass && this._hass.states[id];
+      return { id, name: state ? (state.attributes.friendly_name || id.split(".")[1]) : id.split(".")[1] };
+    });
+  }
+
   async _setVolumeAll(vol) {
     const xml = `<volume>${vol}</volume>`;
     await Promise.all(this._getSpeakerIps().map(ip =>
@@ -168,12 +183,12 @@ class SoundcorkPresetEditor extends HTMLElement {
     const isPodcast = station.guide_id && station.guide_id.startsWith("p");
     const location = isPodcast ? `/v1/playback/show/${station.guide_id}` : `/v1/playback/station/${station.guide_id}`;
     const xml = `<preset id="${this._selectedSlot}"><ContentItem source="TUNEIN" type="stationurl" location="${location}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(artUrl)}</containerArt></ContentItem></preset>`;
-    const ips = this._getSpeakerIps();
+    const ips = this._getTargetIps();
     let ok = 0;
     for (const ip of ips) {
       try { const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, { method:"POST", headers:{"Content-Type":"application/xml"}, body:xml }); if(r.status<400) ok++; } catch(_) {}
     }
-    this._message = ok===ips.length ? `✅ Preset ${this._selectedSlot} saved: ${station.name}` : `⚠️ Saved to ${ok}/${ips.length} speakers`;
+    this._message = ok===ips.length ? `? Preset ${this._selectedSlot} saved: ${station.name}` : `?? Saved to ${ok}/${ips.length} speakers`;
     this._saving = false;
     await this._loadPresets();
     this._render();
@@ -187,6 +202,11 @@ class SoundcorkPresetEditor extends HTMLElement {
     ha-card{background:var(--card-background-color);border-radius:12px;overflow:hidden}
     .card{padding:16px}
     h3{margin:0 0 14px;font-size:12px;font-weight:700;color:var(--secondary-text-color);text-transform:uppercase;letter-spacing:.1em}
+    .spk-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+    .spk-chip{padding:4px 12px;border-radius:20px;border:1.5px solid transparent;cursor:pointer;font-size:12px;font-weight:600;color:var(--primary-text-color);background:var(--secondary-background-color,#2a2a40);transition:border-color .15s,background .15s}
+    .spk-chip.active{border-color:var(--primary-color);background:rgba(3,169,244,.15);color:var(--primary-color)}
+    .spk-chip:hover:not(.active){border-color:rgba(255,255,255,.2)}
+    .spk-chip-all{background:rgba(3,169,244,.1)}
     .spk-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
     .spk-chip{padding:4px 12px;border-radius:20px;border:1.5px solid transparent;cursor:pointer;font-size:12px;font-weight:600;color:var(--primary-text-color);background:var(--secondary-background-color,#2a2a40);transition:border-color .15s,background .15s}
     .spk-chip.active{border-color:var(--primary-color);background:rgba(3,169,244,.15);color:var(--primary-color)}
@@ -251,8 +271,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     const np = data ? data.now_playing : {};
     const vol = data ? data.volume : {};
     const isOff = !np || !np.source || np.source === "STANDBY" || np.isOff;
-    const art = np && np.art_url ? `<img src="${np.art_url}" alt=""/>` : "🔊";
-    const track = np && np.title ? np.title : (isOff ? "Off" : "—");
+    const art = np && np.art_url ? `<img src="${np.art_url}" alt=""/>` : "??";
+    const track = np && np.title ? np.title : (isOff ? "Off" : "?");
     const artist = np && np.artist ? np.artist : "";
     const volVal = vol ? vol.actual : 0;
     const name = this._config.speaker_name || "Speaker";
@@ -261,12 +281,12 @@ class SoundcorkPresetEditor extends HTMLElement {
         <div class="spk-art">${art}</div>
         <div class="spk-info">
           <div class="spk-name">${name}</div>
-          <div class="spk-track">${track}${artist ? " · " + artist : ""}</div>
+          <div class="spk-track">${track}${artist ? " ? " + artist : ""}</div>
         </div>
-        <button class="spk-power" id="spk-pwr" title="Power">${isOff ? "⏻" : "⏼"}</button>
+        <button class="spk-power" id="spk-pwr" title="Power">${isOff ? "?" : "?"}</button>
       </div>
       <div class="vol-row">
-        <span class="vol-label">🔊</span>
+        <span class="vol-label">??</span>
         <input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="${volVal}" ${isOff ? "disabled" : ""}/>
         <span class="vol-val" id="vol-val">${volVal}%</span>
       </div>
@@ -298,27 +318,43 @@ class SoundcorkPresetEditor extends HTMLElement {
           <div class="overlay"></div>
           <span class="slot-badge">${pr.id}</span>
           <span class="label">${pr.name}</span>
-          ${this._playing===pr.id ? `<div class="spin">▶</div>` : ""}
+          ${this._playing===pr.id ? `<div class="spin">?</div>` : ""}
         </button>`).join("");
-      body = `<div class="card"><h3>🎵 Presets</h3><div class="preset-grid">${grid}</div><div class="vol-row"><span class="vol-label">🔊</span><input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="30"/><span class="vol-val" id="vol-val">30%</span></div><button class="off-btn" id="off-btn">⏻ Turn Off All Speakers</button></div>`;
+            const speakerNames = this._getSpeakerNames();
+      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
+      const chipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected ? 'active' : '') + '" data-spk="all">All</span>' + speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id) ? 'active' : '') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
+      body = `<div class="card"><h3>?? Presets</h3><div class="preset-grid">${grid}</div><div class="vol-row"><span class="vol-label">??</span><input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="30"/><span class="vol-val" id="vol-val">30%</span></div><button class="off-btn" id="off-btn">? Turn Off All Speakers</button></div>`;
     } else {
-      const chips = presets.length ? presets.map(pr => `<div class="chip ${this._selectedSlot===pr.id?"active":""}" data-slot="${pr.id}">${pr.art?`<img src="${pr.art}" alt=""/>`:""}  <span>${pr.id}. ${pr.name}</span></div>`).join("") : Array.from({length:6},(_,i)=>`<div class="chip ${this._selectedSlot===i+1?"active":""}" data-slot="${i+1}"><span>${i+1}. —</span></div>`).join("");
-      const results = this._loading ? `<div class="loading">Searching TuneIn…</div>` : this._searchResults.length ? this._searchResults.map(r=>`
+      const chips = presets.length ? presets.map(pr => `<div class="chip ${this._selectedSlot===pr.id?"active":""}" data-slot="${pr.id}">${pr.art?`<img src="${pr.art}" alt=""/>`:""}  <span>${pr.id}. ${pr.name}</span></div>`).join("") : Array.from({length:6},(_,i)=>`<div class="chip ${this._selectedSlot===i+1?"active":""}" data-slot="${i+1}"><span>${i+1}. ?</span></div>`).join("");
+      const results = this._loading ? `<div class="loading">Searching TuneIn?</div>` : this._searchResults.length ? this._searchResults.map(r=>`
         <div class="result ${r.unsupported?"unsupported":""}">
-          <div class="result-art">${r.image?`<img src="${r.image}" alt=""/>`:`<div style="font-size:20px">📻</div>`}</div>
+          <div class="result-art">${r.image?`<img src="${r.image}" alt=""/>`:`<div style="font-size:20px">??</div>`}</div>
           <div class="result-info">
             <div class="result-name">${r.name}${r.unsupported?` <span class='badge'>not supported</span>`:""}${r.is_podcast?` <span class='badge' style='background:rgba(0,150,100,0.3);color:#00c890'>podcast</span>`:""}</div>
             ${r.subtext?`<div class="result-sub">${r.subtext}</div>`:""}
             ${r.bitrate?`<div class="result-sub">${r.bitrate} kbps</div>`:""}
           </div>
-          ${!r.unsupported?`<button class="save-btn" data-guide="${r.guide_id}" data-name="${this._esc(r.name)}" data-image="${this._esc(r.image)}">${this._saving?"…":"Save"}</button>`:""}
+          ${!r.unsupported?`<button class="save-btn" data-guide="${r.guide_id}" data-name="${this._esc(r.name)}" data-image="${this._esc(r.image)}">${this._saving?"?":"Save"}</button>`:""}
         </div>`).join("") : `<div class="empty">Search for a radio station to replace preset ${this._selectedSlot}</div>`;
-      body = `<div class="card"><h3>🔍 TuneIn Preset Editor</h3><div class="chips">${chips}</div><div class="search-row"><input class="search-input" id="si" type="text" placeholder="Search TuneIn… (e.g. WUWM, jazz, NPR)"/><button class="search-btn" id="sb" ${this._loading?"disabled":""}>${this._loading?"…":"Search"}</button></div>${this._message?`<div class="message">${this._message}</div>`:""}<div class="results">${results}</div></div>`;
+      body = `<div class="card"><h3>?? TuneIn Preset Editor</h3><div class="chips">${chips}</div><div class="search-row"><input class="search-input" id="si" type="text" placeholder="Search TuneIn? (e.g. WUWM, jazz, NPR)"/><button class="search-btn" id="sb" ${this._loading?"disabled":""}>${this._loading?"?":"Search"}</button></div>${this._message?`<div class="message">${this._message}</div>`:""}<div class="results">${results}</div></div>`;
     }
     this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card>${body}</ha-card>`;
     if (p) {
       this.shadowRoot.querySelectorAll(".preset-btn").forEach(b => b.addEventListener("click", () => { const pr = this._currentPresets.find(x=>x.id===parseInt(b.dataset.id)); if(pr) this._playPreset(pr); }));
       this.shadowRoot.getElementById("off-btn")?.addEventListener("click", () => this._turnOffAll());
+      this.shadowRoot.querySelectorAll(".spk-chip").forEach(chip => {
+        chip.addEventListener("click", () => {
+          const spk = chip.dataset.spk;
+          if (spk === "all") { this._selectedSpeakers = null; }
+          else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (this._selectedSpeakers.length === 0) this._selectedSpeakers = null; }
+            else { this._selectedSpeakers.push(spk); }
+          }
+          this._render();
+        });
+      });
       this.shadowRoot.querySelectorAll(".spk-chip").forEach(chip => {
         chip.addEventListener("click", () => {
           const spk = chip.dataset.spk;

@@ -87,7 +87,7 @@ By default, SSH access is only enabled when the USB stick is present on boot. To
 
 ```bash
 rw
-touch /mnt/nv/remote_service
+touch /mnt/nv/remote_services
 ```
 
 This creates a permanent file on the speaker's internal storage that keeps SSH enabled across reboots. Without this step, you would need to repeat the USB stick process every time the speaker loses power.
@@ -164,7 +164,7 @@ You should see:
 ```dockerfile
 FROM ghcr.io/timvw/soundcork:main
 COPY main.py /app/soundcork/main.py
-COPY app.js /app/soundcork/webui/static/app.js
+
 ```
 
 This takes the base SoundCork image and replaces two files with our patched versions.
@@ -449,7 +449,8 @@ From your Home Assistant terminal or via SSH to the HA server:
 
 ```bash
 # Copy integration files to HA config directory
-scp -r root@192.168.1.229:/soundcork/custom_components/soundcork \
+# Copy from the cloned repo (ha-integration folder)
+cp -r /soundcork/ha-integration/custom_components/soundcork \
   /config/custom_components/
 ```
 
@@ -478,7 +479,7 @@ A `media_player` entity will be created for each speaker registered in `webui_sp
 ### 8.1 Copy the card file to HA
 
 ```bash
-scp root@192.168.1.229:/soundcork/lovelace/soundcork-preset-editor.js \
+cp /soundcork/lovelace-card/soundcork-preset-editor.js \
   /config/www/soundcork-preset-editor.js
 ```
 
