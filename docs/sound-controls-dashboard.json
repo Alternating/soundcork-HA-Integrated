@@ -1,0 +1,151 @@
+{
+  "version": 1,
+  "minor_version": 1,
+  "key": "lovelace.sound_controls",
+  "data": {
+    "config": {
+      "views": [
+        {
+          "icon": "mdi:speaker",
+          "title": "Sound Controls",
+          "type": "sections",
+          "max_columns": 3,
+          "sections": [
+            {
+              "type": "grid",
+              "cards": [
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "mode": "player",
+                  "speakers": [
+                    "media_player.the_deck_2",
+                    "media_player.seven_2",
+                    "media_player.thebedroom_2",
+                    "media_player.amelia_s_lair_2",
+                    "media_player.kitchen_2",
+                    "media_player.jefe_negro_2",
+                    "media_player.pooptown",
+                    "media_player.downstairs"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "mode": "editor",
+                  "speakers": [
+                    "media_player.the_deck_2",
+                    "media_player.seven_2",
+                    "media_player.thebedroom_2",
+                    "media_player.amelia_s_lair_2",
+                    "media_player.kitchen_2",
+                    "media_player.jefe_negro_2",
+                    "media_player.pooptown",
+                    "media_player.downstairs"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "mode": "pandora",
+                  "speakers": [
+                    "media_player.the_deck_2",
+                    "media_player.seven_2",
+                    "media_player.thebedroom_2",
+                    "media_player.amelia_s_lair_2",
+                    "media_player.kitchen_2",
+                    "media_player.jefe_negro_2",
+                    "media_player.pooptown",
+                    "media_player.downstairs"
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "grid",
+              "cards": [
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "The Deck",
+                  "speakers": [
+                    "media_player.the_deck_2"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "Seven",
+                  "speakers": [
+                    "media_player.seven_2"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "TheBedroom",
+                  "speakers": [
+                    "media_player.thebedroom_2"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "Jefe Negro",
+                  "speakers": [
+                    "media_player.jefe_negro_2"
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "grid",
+              "cards": [
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "Kitchen",
+                  "speakers": [
+                    "media_player.kitchen_2"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "Amelia's Lair",
+                  "speakers": [
+                    "media_player.amelia_s_lair_2"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "Pooptown",
+                  "speakers": [
+                    "media_player.pooptown"
+                  ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "mode": "speaker",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "speaker_name": "Downstairs",
+                  "speakers": [
+                    "media_player.downstairs"
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
