@@ -44,7 +44,11 @@ class SoundcorkPresetEditor extends HTMLElement {
   get _speakers() { return this._config.speakers || []; }
 
   _getSpeakerIps() {
-    return this._speakers.map(id => this._hass && this._hass.states[id] && this._hass.states[id].attributes.ip_address).filter(Boolean);
+    return this._speakers.map(id => {
+      const state = this._hass && this._hass.states[id];
+      if (!state || state.state === "unavailable") return null;
+      return state.attributes.ip_address;
+    }).filter(Boolean);
   }
 
   get _data() {
@@ -75,27 +79,36 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   async _loadPresets() {
-    const ip = this._getSpeakerIps()[0];
-    if (!ip) return;
-    try {
-      const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/presets`);
-      const doc = new DOMParser().parseFromString(await r.text(), "application/xml");
-      const presets = [];
-      doc.querySelectorAll("preset").forEach(p => {
-        const ci = p.querySelector("ContentItem");
-        if (ci) presets.push({
-          id: parseInt(p.getAttribute("id")),
-          name: ci.querySelector("itemName")?.textContent || `Preset ${p.getAttribute("id")}`,
-          art: ci.querySelector("containerArt")?.textContent || "",
-          source: ci.getAttribute("source") || "",
-          location: ci.getAttribute("location") || "",
-          type: ci.getAttribute("type") || "",
-          sourceAccount: ci.getAttribute("sourceAccount") || "",
+    // Try each speaker in order until one responds - resilient to individual speakers being offline
+    const ips = this._getSpeakerIps();
+    for (const ip of ips) {
+      try {
+        const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/presets`, {signal: AbortSignal.timeout(4000)});
+        if (!r.ok) continue;
+        const doc = new DOMParser().parseFromString(await r.text(), "application/xml");
+        const presets = [];
+        doc.querySelectorAll("preset").forEach(p => {
+          const ci = p.querySelector("ContentItem");
+          if (ci) presets.push({
+            id: parseInt(p.getAttribute("id")),
+            name: ci.querySelector("itemName")?.textContent || `Preset ${p.getAttribute("id")}`,
+            art: ci.querySelector("containerArt")?.textContent || "",
+            source: ci.getAttribute("source") || "",
+            location: ci.getAttribute("location") || "",
+            type: ci.getAttribute("type") || "",
+            sourceAccount: ci.getAttribute("sourceAccount") || "",
+          });
         });
-      });
-      this._currentPresets = presets;
-      this._render();
-    } catch(e) { console.warn("SoundCork: loadPresets failed", e); }
+        if (presets.length > 0) {
+          this._currentPresets = presets;
+          this._render();
+          return; // success - stop trying
+        }
+      } catch(e) {
+        console.debug(`SoundCork: preset fetch failed for ${ip}, trying next...`);
+      }
+    }
+    console.warn("SoundCork: could not load presets from any speaker");
   }
 
   _getTargetSpeakers() {
@@ -103,17 +116,30 @@ class SoundcorkPresetEditor extends HTMLElement {
     return targetIds.map(id => {
       const state = this._hass && this._hass.states[id];
       if (!state) return null;
+      // Skip truly unavailable speakers (no HA entity data at all)
+      if (state.state === "unavailable") return null;
       return { ip: state.attributes.ip_address, device_id: state.attributes.device_id };
     }).filter(s => s && s.ip && s.device_id);
+  }
+
+  async _reachable(ip) {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/now-playing`, {signal: AbortSignal.timeout(800)});
+      const text = await r.text();
+      return r.ok && !text.includes("Cannot reach");
+    } catch(e) { return false; }
   }
 
   async _playWithZone(xml) {
     const targets = this._getTargetSpeakers();
     if (!targets.length) return;
-    if (targets.length === 1) {
-      await fetch(`${this._baseUrl}/api/v1/speakers/${targets[0].ip}/select`, {method:"POST",headers:{"Content-Type":"application/xml"},body:xml}).catch(()=>{});
+    // Filter to only reachable speakers before building zone
+    const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
+    if (!reachable.length) { console.warn("SoundCork: no reachable speakers"); return; }
+    if (reachable.length === 1) {
+      await fetch(`${this._baseUrl}/api/v1/speakers/${reachable[0].ip}/select`, {method:"POST",headers:{"Content-Type":"application/xml"},body:xml}).catch(()=>{});
     } else {
-      const master = targets[0], slaves = targets.slice(1);
+      const master = reachable[0], slaves = reachable.slice(1);
       await fetch(`${this._baseUrl}/api/v1/zone/set`, {
         method:"POST", headers:{"Content-Type":"application/json"},
         body: JSON.stringify({ master_ip: master.ip, master_device_id: master.device_id, slaves: slaves })
