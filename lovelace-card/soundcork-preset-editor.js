@@ -18,6 +18,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._selectedSpeakers = null;
     this._activeTab = 'tunein';
     this._pandoraStations = [];
+    this._pandoraRefreshing = false;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -212,12 +213,15 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   async _loadPandora() {
+    this._pandoraRefreshing = true;
+    this._render();
     try {
       const r = await fetch(`${this._baseUrl}/api/v1/pandora/stations`);
       const data = await r.json();
       this._pandoraStations = data.stations || [];
-      this._render();
     } catch(e) { console.warn('SoundCork: loadPandora failed', e); }
+    this._pandoraRefreshing = false;
+    this._render();
   }
 
   async _playPandora(station) {
@@ -307,6 +311,11 @@ class SoundcorkPresetEditor extends HTMLElement {
     .off-btn{width:100%;padding:9px;border-radius:8px;border:none;background:rgba(200,0,0,.25);color:#ff6b6b;font-size:13px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:background .15s}
     .off-btn:hover{background:rgba(200,0,0,.4)}
     .pandora-list{display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto}
+    .pandora-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+    .refresh-btn{background:none;border:none;cursor:pointer;color:var(--secondary-text-color);font-size:16px;padding:2px 6px;border-radius:6px;transition:color .15s,background .15s}
+    .refresh-btn:hover{color:var(--primary-color);background:rgba(3,169,244,.1)}
+    .refresh-btn.spinning{animation:spin .7s linear infinite}
+    @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
     .pandora-item{display:flex;align-items:center;gap:10px;padding:8px;border-radius:8px;background:var(--secondary-background-color,#2a2a40)}
     .pandora-art{width:48px;height:48px;border-radius:6px;overflow:hidden;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;font-size:24px}
     .pandora-art img{width:100%;height:100%;object-fit:cover}
@@ -426,13 +435,17 @@ class SoundcorkPresetEditor extends HTMLElement {
       }
 
       this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="card">
-        <h3>Pandora</h3>
+        <div class="pandora-header">
+          <h3 style="margin:0">Pandora</h3>
+          <button class="refresh-btn ${this._pandoraRefreshing ? 'spinning' : ''}" id="pandora-refresh" title="Refresh stations">&#x21BB;</button>
+        </div>
         <div style="font-size:11px;color:var(--secondary-text-color);margin-bottom:10px;">Select a preset slot to save to, then click Save on any station.</div>
         <div class="chips">${chipsHtml}</div>
         ${this._message?`<div class="message">${this._message}</div>`:''}
         <div class="pandora-list">${stationHtml}</div>
       </div></ha-card>`;
 
+      this.shadowRoot.getElementById('pandora-refresh')?.addEventListener('click', () => { if (!this._pandoraRefreshing) this._loadPandora(); });
       this.shadowRoot.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { this._selectedSlot=parseInt(c.dataset.slot); this._render(); }));
       this.shadowRoot.querySelectorAll('.play-btn').forEach(b => b.addEventListener('click', () => this._playPandora({ location:b.dataset.loc, sourceAccount:b.dataset.acct, name:b.dataset.name, art:b.dataset.art })));
       this.shadowRoot.querySelectorAll('.save-btn').forEach(b => b.addEventListener('click', () => this._savePandoraPreset({ location:b.dataset.loc, sourceAccount:b.dataset.acct, name:b.dataset.name, art:b.dataset.art })));
