@@ -19,6 +19,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._activeTab = 'tunein';
     this._pandoraStations = [];
     this._pandoraRefreshing = false;
+    this._podcastStatus = null;
+    this._podcastLoading = false;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -367,6 +369,18 @@ class SoundcorkPresetEditor extends HTMLElement {
     .save-btn:hover{opacity:.85}
     .loading{text-align:center;padding:16px;color:var(--secondary-text-color);font-size:13px}
     .empty{text-align:center;padding:20px;color:var(--secondary-text-color);font-size:13px}
+    .podcast-card{padding:16px}
+    .podcast-url-row{display:flex;gap:8px;margin-bottom:12px}
+    .podcast-url-input{flex:1;padding:8px 12px;border-radius:8px;border:1.5px solid var(--divider-color,#333);background:var(--secondary-background-color,#2a2a40);color:var(--primary-text-color);font-size:13px;outline:none;font-family:monospace}
+    .podcast-url-input:focus{border-color:var(--primary-color)}
+    .podcast-play-btn{padding:8px 18px;border-radius:8px;border:none;background:var(--primary-color,#03a9f4);color:#fff;font-size:14px;font-weight:600;cursor:pointer;transition:opacity .15s;flex-shrink:0}
+    .podcast-play-btn:hover{opacity:.85}
+    .podcast-play-btn:disabled{opacity:.5;cursor:not-allowed}
+    .podcast-status{padding:10px 12px;border-radius:8px;font-size:13px;margin-bottom:10px}
+    .podcast-status.success{background:rgba(3,169,244,.15);color:var(--primary-text-color)}
+    .podcast-status.error{background:rgba(200,0,0,.2);color:#ff6b6b}
+    .podcast-status.loading{background:rgba(255,255,255,.05);color:var(--secondary-text-color)}
+    .podcast-hint{font-size:11px;color:var(--secondary-text-color);margin-bottom:14px;line-height:1.5}
     .pandora-btns{display:flex;gap:6px;flex-shrink:0}
     .play-btn{padding:5px 10px;border-radius:6px;border:none;background:rgba(3,169,244,.2);color:var(--primary-color);font-size:12px;font-weight:600;cursor:pointer}
     .play-btn:hover{background:rgba(3,169,244,.35)}
@@ -399,7 +413,90 @@ class SoundcorkPresetEditor extends HTMLElement {
     </div>`;
   }
 
+  async _playPodcast(url) {
+    const targets = this._getTargetSpeakers();
+    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
+    const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
+    if (!reachable.length) { this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
+    const master = reachable[0], slaves = reachable.slice(1);
+    this._podcastLoading = true;
+    this._podcastStatus = {type:'loading', msg:'Looking up episode...'};
+    this._render();
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/tunein/play-podcast`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ url, master_ip: master.ip, master_device_id: master.device_id, slaves })
+      });
+      const data = await r.json();
+      if (r.ok && data.success) {
+        this._podcastStatus = {type:'success', msg:`Playing: ${data.title} on ${data.speakers} speaker${data.speakers>1?'s':''}`};
+      } else {
+        this._podcastStatus = {type:'error', msg: data.detail || 'Playback failed'};
+      }
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg:'Network error - check SoundCork connection'};
+    }
+    this._podcastLoading = false;
+    // Don't re-render on success - preserve the URL in the input
+    if (this._podcastStatus && this._podcastStatus.type !== 'success') this._render();
+    else {
+      // Just update the status display without full re-render
+      const statusEl = this.shadowRoot.querySelector('.podcast-status');
+      if (!statusEl && this._podcastStatus) {
+        const row = this.shadowRoot.querySelector('.podcast-url-row');
+        if (row) {
+          const div = document.createElement('div');
+          div.className = 'podcast-status ' + this._podcastStatus.type;
+          div.textContent = this._podcastStatus.msg;
+          row.parentNode.insertBefore(div, row);
+        }
+      } else if (statusEl) {
+        statusEl.className = 'podcast-status ' + this._podcastStatus.type;
+        statusEl.textContent = this._podcastStatus.msg;
+      }
+    }
+    setTimeout(() => { this._podcastStatus = null; const el = this.shadowRoot.querySelector('.podcast-status'); if(el) el.remove(); }, 8000);
+  }
+
   _render() {
+    if (this._mode === "podcast") {
+      const speakerNames = this._getSpeakerNames();
+      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
+      const chipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected?'active':'') + '" data-spk="all">All</span>' +
+        speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
+      const statusHtml = this._podcastStatus ? `<div class="podcast-status ${this._podcastStatus.type}">${this._podcastStatus.msg}</div>` : '';
+      this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
+        <h3>Podcast Player</h3>
+        <p class="podcast-hint">Paste a TuneIn episode URL (tun.in short links or full tunein.com episode URLs).<br>Select speakers then press Play.</p>
+        ${chipsHtml}
+        ${statusHtml}
+        <div class="podcast-url-row">
+          <input class="podcast-url-input" id="podcast-url" type="text" placeholder="e.g. http://tun.in/tLU13Y" spellcheck="false" autocomplete="off"/>
+          <button class="podcast-play-btn" id="podcast-play" ${this._podcastLoading?'disabled':''}>
+            ${this._podcastLoading ? '...' : 'Play'}
+          </button>
+        </div>
+      </div></ha-card>`;
+      this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          const spk = chip.dataset.spk;
+          if (spk === 'all') { this._selectedSpeakers = null; }
+          else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (!this._selectedSpeakers.length) this._selectedSpeakers = null; }
+            else { this._selectedSpeakers.push(spk); }
+          }
+          this._render();
+        });
+      });
+      const urlInput = this.shadowRoot.getElementById('podcast-url');
+      const playBtn = this.shadowRoot.getElementById('podcast-play');
+      const doPlay = () => { const u = urlInput.value.trim(); if (u) this._playPodcast(u); };
+      playBtn?.addEventListener('click', doPlay);
+      urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') doPlay(); });
+      return;
+    }
     if (this._mode === "pandora") {
       // Group stations by account
       const accounts = {};

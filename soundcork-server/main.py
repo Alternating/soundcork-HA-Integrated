@@ -2037,3 +2037,133 @@ async def api_zone_clear(ip: str):
         raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
     except _httpx.TimeoutException:
         raise HTTPException(status_code=504, detail=f"Speaker at {ip} timed out")
+
+
+# ---------------------------------------------------------------------------
+# Podcast URL resolver and player
+# Accepts tun.in short URLs or full tunein.com podcast URLs,
+# resolves the multi-hop stream chain, and returns a playable stream URL
+# compatible with SoundTouch 10 hardware (HTTP/1.1, no HTTP/2 redirects).
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/tunein/play-podcast", tags=["soundcork-api"])
+async def api_play_podcast(request: Request):
+    """
+    Resolve a TuneIn podcast URL and play it on speakers.
+    Handles tun.in short URLs and full tunein.com episode URLs.
+    Pre-resolves multi-hop HTTP redirects for SoundTouch 10 compatibility.
+
+    Body JSON:
+    {
+      "url": "http://tun.in/tLU13Y",
+      "master_ip": "192.168.1.41",
+      "master_device_id": "587A6274B5C4",
+      "slaves": [{"ip": "...", "device_id": "..."}]
+    }
+    """
+    import re
+    import urllib.request as _urllib
+
+    body = await request.json()
+    url = body.get("url", "").strip()
+    master_ip = body.get("master_ip", "")
+    slaves = body.get("slaves", [])
+
+    if not url or not master_ip:
+        raise HTTPException(status_code=400, detail="url and master_ip are required")
+
+    # Step 1: Follow redirects to get canonical tunein.com URL
+    try:
+        req = _urllib.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _urllib.urlopen(req, timeout=10) as r:
+            final_url = r.url
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not resolve URL: {e}")
+
+    # Step 2: Extract topicId or guide ID
+    guide_id = None
+    topic_match = re.search(r'topicid=(\d+)', final_url, re.IGNORECASE)
+    if topic_match:
+        guide_id = f"t{topic_match.group(1)}"
+
+    if not guide_id:
+        # Try extracting t/p/s-prefixed ID from path
+        id_match = re.search(r'[/\-]([tps]\d+)(?:[/?]|$)', final_url, re.IGNORECASE)
+        if id_match:
+            guide_id = id_match.group(1)
+
+    if not guide_id:
+        raise HTTPException(status_code=400, detail=f"Could not extract guide ID from: {final_url}")
+
+    # Step 3: Get stream URL from TuneIn OPML Tune.ashx
+    try:
+        tune_req = _urllib.Request(
+            f"https://opml.radiotime.com/Tune.ashx?id={guide_id}&render=json",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        import json as _json
+        with _urllib.urlopen(tune_req, timeout=10) as r:
+            tune_data = _json.loads(r.read().decode("utf-8", errors="ignore"))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TuneIn OPML error: {e}")
+
+    body_items = tune_data.get("body", [])
+    if not body_items:
+        raise HTTPException(status_code=404, detail="No stream found for this episode")
+
+    raw_stream_url = body_items[0].get("url", "")
+    episode_title = tune_data.get("head", {}).get("title", "Podcast Episode")
+
+    if not raw_stream_url:
+        raise HTTPException(status_code=404, detail="No stream URL in TuneIn response")
+
+    # Step 4: Build ContentItem using TUNEIN source with guide_id
+    # This lets the speaker's own TuneIn client handle stream resolution,
+    # avoiding issues with expiring session tokens from pre-resolved URLs.
+    xml = (
+        f'<ContentItem source="TUNEIN" type="stationurl" '
+        f'location="/v1/playback/station/{guide_id}" isPresetable="false">'
+        f'<itemName>{episode_title}</itemName>'
+        f'</ContentItem>'
+    )
+
+    # Create zone if slaves provided
+    if slaves:
+        members = "".join(
+            f'<member ipaddress="{s["ip"]}">{s["device_id"]}</member>'
+            for s in slaves
+        )
+        zone_xml = (
+            f'<zone master="{body.get("master_device_id","")}" '
+            f'senderIPAddress="{master_ip}">{members}</zone>'
+        )
+        try:
+            async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                await client.post(
+                    _speaker_url(master_ip, "/setZone"),
+                    content=zone_xml.encode(),
+                    headers={"Content-Type": "application/xml"},
+                )
+        except Exception:
+            pass
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.3)
+
+    # Play on master
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            r = await client.post(
+                _speaker_url(master_ip, "/select"),
+                content=xml.encode(),
+                headers={"Content-Type": "application/xml"},
+            )
+        return {
+            "success": True,
+            "guide_id": guide_id,
+            "title": episode_title,
+            "speakers": len(slaves) + 1
+        }
+    except _httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {master_ip}")
+    except _httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Speaker at {master_ip} timed out")

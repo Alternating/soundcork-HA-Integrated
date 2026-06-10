@@ -58,6 +58,21 @@
                     "media_player.pooptown",
                     "media_player.downstairs"
                   ]
+                },
+                {
+                  "type": "custom:soundcork-preset-editor",
+                  "soundcork_url": "http://192.168.1.229:8000",
+                  "mode": "podcast",
+                  "speakers": [
+                    "media_player.the_deck_2",
+                    "media_player.seven_2",
+                    "media_player.thebedroom_2",
+                    "media_player.amelia_s_lair_2",
+                    "media_player.kitchen_2",
+                    "media_player.jefe_negro_2",
+                    "media_player.pooptown",
+                    "media_player.downstairs"
+                  ]
                 }
               ]
             },
