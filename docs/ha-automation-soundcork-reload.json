@@ -1,0 +1,11 @@
+{
+  "alias": "SoundCork - Auto Reload on HA Start",
+  "description": "Reloads the SoundCork integration 60 seconds after HA starts to ensure speakers reconnect after a reboot.",
+  "triggers": [{"event": "start", "trigger": "homeassistant"}],
+  "conditions": [],
+  "actions": [
+    {"delay": {"seconds": 60}},
+    {"action": "homeassistant.reload_config_entry", "data": {"entry_id": "REPLACE_WITH_YOUR_ENTRY_ID"}}
+  ],
+  "mode": "single"
+}
