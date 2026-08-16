@@ -87,3 +87,18 @@ store_preset_radio:
       required: false
       selector:
         text:
+
+restore_all_presets:
+  name: Restore All Presets
+  description: >
+    Recover every SoundCork speaker's presets from the account's known-good
+    baseline (soundcork/data/{account}/Presets.xml) - the same data marge
+    serves speakers on power-on. Use this if a card, script, or misclick
+    wipes presets across the household. Requires confirm: true.
+  fields:
+    confirm:
+      name: Confirm
+      description: Must be true to actually run the restore.
+      required: true
+      selector:
+        boolean:

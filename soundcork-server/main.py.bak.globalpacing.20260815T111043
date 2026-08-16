@@ -1740,39 +1740,6 @@ def _wrap_local_internet_radio_content_item(preset_elem: ET.Element) -> None:
     )
 
 
-_STORE_PRESET_GLOBAL_LOCK = asyncio.Lock()
-_STORE_PRESET_MIN_INTERVAL_SECONDS = 1.0
-_last_store_preset_at = {"t": 0.0}
-
-
-async def _pace_store_preset_globally():
-    """
-    Serialize + pace EVERY storePreset write through one choke point,
-    regardless of which speaker it targets or which client issued it
-    (webui, HA integration, lovelace card, our own restore endpoints).
-
-    Root-caused twice on 2026-08-15: an unpaced burst of storePreset
-    writes -- even just one write per speaker, fired back-to-back across
-    *different* speakers with no gap -- corrupted TheDeck's and Seven's
-    entire onboard preset stores (not just the slot being written). The
-    restore endpoints already paced their own internal writes, but
-    api_store_preset (used directly by the webui, HA's store_preset_radio/
-    store_preset_tunein services, and the "TuneIn Preset Editor" lovelace
-    card's per-speaker save loop) had no pacing at all -- so any of those
-    callers broadcasting a save to "All" speakers could still reproduce
-    the original incident. This makes api_store_preset itself safe no
-    matter what calls it, instead of relying on every caller to pace
-    itself correctly.
-    """
-    async with _STORE_PRESET_GLOBAL_LOCK:
-        loop = asyncio.get_event_loop()
-        now = loop.time()
-        wait = _STORE_PRESET_MIN_INTERVAL_SECONDS - (now - _last_store_preset_at["t"])
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_store_preset_at["t"] = loop.time()
-
-
 def _preset_backup_dir_for(ip: str) -> str:
     d = os.path.join(_PRESET_BACKUP_DIR, ip.replace(":", "_"))
     os.makedirs(d, exist_ok=True)
@@ -1814,7 +1781,6 @@ async def api_store_preset(ip: str, request: Request):
     POST /api/v1/speakers/{ip}/presets/restore.
     """
     body = await request.body()
-    await _pace_store_preset_globally()
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
             await _snapshot_speaker_presets(client, ip)

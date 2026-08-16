@@ -1,8 +1,6 @@
 """SoundCork media player entities."""
 from __future__ import annotations
 
-import base64
-import json
 import logging
 from typing import Any
 
@@ -393,32 +391,11 @@ class SoundCorkMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
     async def async_store_preset_radio(
         self, preset_num: int, stream_url: str, name: str, art_url: str = ""
     ) -> None:
-        """Store a direct radio stream URL as a preset.
-
-        Root-caused 2026-08-15: writing the bare `stream_url` straight into
-        `location` here looks correct (SoundCork accepts it, /presets
-        reflects it) but the speaker firmware will not reliably stream from
-        it -- it needs `location` to point back at SoundCork's own
-        /core02/svc-bmx-adapter-orion/prod/orion/station proxy, with
-        {name, imageUrl, streamUrl} base64-encoded as the `data` query
-        param. This mirrors exactly what SoundCork's own webui "Save
-        Preset" flow does (soundcork/webui/static/app.js). Without this
-        wrapping, a preset saved via this service silently never plays --
-        same failure mode as the SoundCork-side restore-endpoint bug from
-        the same incident (see docs/incidents/2026-08-15-preset-playback-
-        outage.md).
-        """
-        payload = base64.b64encode(
-            json.dumps({"name": name, "imageUrl": art_url, "streamUrl": stream_url}).encode()
-        ).decode()
-        wrapped_location = (
-            f"{self.coordinator.base_url}/core02/svc-bmx-adapter-orion/prod/orion/station"
-            f"?data={payload}"
-        )
+        """Store a direct radio stream URL as a preset."""
         xml = (
             f'<preset id="{preset_num}">'
             f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
-            f'location="{wrapped_location}" '
+            f'location="{stream_url}" '
             f'isPresetable="true">'
             f"<itemName>{name}</itemName>"
             f"<containerArt>{art_url}</containerArt>"

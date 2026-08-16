@@ -275,6 +275,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     ));
   }
 
+  _getTargetIps() {
+    if (this._selectedSpeakers && this._selectedSpeakers.length > 0) {
+      return this._selectedSpeakers.map(id => this._hass && this._hass.states[id] && this._hass.states[id].attributes.ip_address).filter(Boolean);
+    }
+    return this._getSpeakerIps();
+  }
+
+  _getSpeakerNames() {
+    return this._speakers.map(id => {
+      const state = this._hass && this._hass.states[id];
+      return { id, name: state ? (state.attributes.friendly_name || id.split(".")[1]) : id.split(".")[1] };
+    });
+  }
+
   async _setVolumeAll(vol) {
     const xml = `<volume>${vol}</volume>`;
     await Promise.all(this._getSpeakerIps().map(ip =>
@@ -301,41 +315,6 @@ class SoundcorkPresetEditor extends HTMLElement {
     await this._playWithZone(xml);
   }
 
-  async _storePresetOnSpeakers(ips, xml) {
-    // Write a preset to every target speaker with a bounded per-request timeout
-    // and one retry, and report back exactly which IPs succeeded vs failed.
-    //
-    // Root cause (found 2026-08-15): the three save flows below used to run
-    // `fetch(...).catch(()=>{})` in a plain for-loop with NO timeout, only
-    // incrementing a numeric `ok` counter. A single slow/flaky speaker (e.g.
-    // the known Pooptown/Jefe Negro wifi reliability issue) could hang or
-    // silently fail its fetch, and the only visible symptom was a generic
-    // "Saved to 6/8 speakers" message (or, if the speaker had already been
-    // filtered out earlier by _getSpeakerIps as unavailable, no indication
-    // at all - the success message just said "Preset saved" with no count).
-    // Either way there was no way to tell WHICH speakers were skipped without
-    // manually checking each one, which is how the Radio LaB test silently
-    // missed Pooptown and Downstairs. This now names the failures explicitly.
-    const succeeded = [];
-    const failed = [];
-    for (const ip of ips) {
-      let done = false;
-      for (let attempt = 0; attempt < 2 && !done; attempt++) {
-        try {
-          const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, {
-            method: "POST",
-            headers: { "Content-Type": "application/xml" },
-            body: xml,
-            signal: AbortSignal.timeout(8000),
-          });
-          if (r.status < 400) { succeeded.push(ip); done = true; }
-        } catch (e) { /* network error or timeout - fall through to retry */ }
-      }
-      if (!done) failed.push(ip);
-    }
-    return { succeeded, failed };
-  }
-
     async _savePandoraPreset(station) {
     if (this._saving) return;
     const slot = this._selectedSlot;
@@ -344,18 +323,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (!this._confirmWrite(slot, station.name, ips)) return;
     this._saving = true; this._message = null; this._render();
     const xml = `<preset id="${slot}"><ContentItem source="PANDORA" location="${station.location}" sourceAccount="${station.sourceAccount}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(station.art)}</containerArt></ContentItem></preset>`;
-    const { succeeded, failed } = await this._storePresetOnSpeakers(ips, xml);
+    let ok = 0;
+    for (const ip of ips) {
+      try { const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, { method:'POST', headers:{'Content-Type':'application/xml'}, body:xml }); if(r.status<400) ok++; } catch(_) {}
+    }
     this._saving = false;
     await this._loadPresets();
-    if (!failed.length) {
+    if (ok === ips.length) {
       this._message = `Preset ${slot} saved: ${station.name}`;
       this._render();
-      this._offerUndo(succeeded);
+      this._offerUndo(ips);
     } else {
-      const failedNames = this._targetSpeakerNames(failed);
-      this._message = `Saved to ${succeeded.length}/${ips.length} speakers - FAILED: ${failedNames.join(", ")}`;
+      this._message = `Saved to ${ok}/${ips.length} speakers`;
       this._render();
-      setTimeout(() => { this._message=null; this._render(); }, 8000);
+      setTimeout(() => { this._message=null; this._render(); }, 4000);
     }
   }
 
@@ -392,18 +373,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     const isPodcast = station.guide_id && station.guide_id.startsWith("p");
     const location = isPodcast ? `/v1/playback/show/${station.guide_id}` : `/v1/playback/station/${station.guide_id}`;
     const xml = `<preset id="${slot}"><ContentItem source="TUNEIN" type="stationurl" location="${location}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(artUrl)}</containerArt></ContentItem></preset>`;
-    const { succeeded, failed } = await this._storePresetOnSpeakers(ips, xml);
+    let ok = 0;
+    for (const ip of ips) {
+      try { const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, { method:"POST", headers:{"Content-Type":"application/xml"}, body:xml }); if(r.status<400) ok++; } catch(_) {}
+    }
     this._saving = false;
     await this._loadPresets();
-    if (!failed.length) {
+    if (ok === ips.length) {
       this._message = `Preset ${slot} saved: ${station.name} (TuneIn - Bose's TuneIn backend is unreliable, verify it actually plays)`;
       this._render();
-      this._offerUndo(succeeded);
+      this._offerUndo(ips);
     } else {
-      const failedNames = this._targetSpeakerNames(failed);
-      this._message = `Saved to ${succeeded.length}/${ips.length} speakers - FAILED: ${failedNames.join(", ")}`;
+      this._message = `Saved to ${ok}/${ips.length} speakers`;
       this._render();
-      setTimeout(() => { this._message=null; this._render(); }, 8000);
+      setTimeout(() => { this._message=null; this._render(); }, 4000);
     }
   }
 
@@ -425,26 +408,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     const current = this._currentPresets.find(p => p.id === slot);
     const currentName = current ? current.name : "(empty)";
     const speakerLabel = ips.length > 1 ? `${ips.length} speakers (${targetNames.join(", ")})` : (targetNames[0] || ips[0]);
-    let msg = `Replace preset ${slot} on ${speakerLabel}?\n\nCurrently: ${currentName}\nNew: ${newName}`;
-    // Surface any speaker that was silently dropped from `ips` before we ever
-    // got here (unavailable in HA, or missing an ip_address attribute) - this
-    // is the pre-flight half of the 2026-08-15 "saved to 6/8 speakers" bug.
-    // Without this, a speaker excluded by _getSpeakerIps()/_getTargetIps()
-    // never showed up anywhere: the confirm dialog and success message both
-    // only ever knew about the already-filtered `ips` list.
-    const requestedIds = (this._selectedSpeakers && this._selectedSpeakers.length > 0) ? this._selectedSpeakers : this._speakers;
-    const excludedIds = requestedIds.filter(id => {
-      const s = this._hass && this._hass.states[id];
-      const ip = s && s.attributes.ip_address;
-      return !ip || !ips.includes(ip);
-    });
-    if (excludedIds.length) {
-      const excludedNames = excludedIds.map(id => {
-        const s = this._hass && this._hass.states[id];
-        return s ? (s.attributes.friendly_name || id.split(".")[1]) : id.split(".")[1];
-      });
-      msg += `\n\nWARNING: skipping ${excludedNames.join(", ")} (unavailable right now) - preset will NOT be updated there.`;
-    }
+    const msg = `Replace preset ${slot} on ${speakerLabel}?\n\nCurrently: ${currentName}\nNew: ${newName}`;
     return window.confirm(msg);
   }
 
@@ -479,18 +443,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (!this._confirmWrite(slot, name || streamUrl, ips)) return;
     this._saving = true; this._message = null; this._render();
     const xml = `<preset id="${slot}"><ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" location="${this._esc(streamUrl.trim())}" isPresetable="true"><itemName>${this._esc(name || streamUrl)}</itemName><containerArt>${this._esc(artUrl||"")}</containerArt></ContentItem></preset>`;
-    const { succeeded, failed } = await this._storePresetOnSpeakers(ips, xml);
+    let ok = 0;
+    for (const ip of ips) {
+      try { const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, { method:"POST", headers:{"Content-Type":"application/xml"}, body:xml }); if(r.status<400) ok++; } catch(_) {}
+    }
     this._saving = false;
     await this._loadPresets();
-    if (!failed.length) {
+    if (ok === ips.length) {
       this._message = `Preset ${slot} saved: ${name || streamUrl}`;
       this._render();
-      this._offerUndo(succeeded);
+      this._offerUndo(ips);
     } else {
-      const failedNames = this._targetSpeakerNames(failed);
-      this._message = `Saved to ${succeeded.length}/${ips.length} speakers - FAILED: ${failedNames.join(", ")}`;
+      this._message = `Saved to ${ok}/${ips.length} speakers`;
       this._render();
-      setTimeout(() => { this._message=null; this._render(); }, 8000);
+      setTimeout(() => { this._message=null; this._render(); }, 4000);
     }
   }
 

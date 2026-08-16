@@ -17,6 +17,7 @@ ATTR_SPEAKER_TYPE = "speaker_type"
 SERVICE_PLAY_PRESET = "play_preset"
 SERVICE_STORE_PRESET_TUNEIN = "store_preset_tunein"
 SERVICE_STORE_PRESET_RADIO = "store_preset_radio"
+SERVICE_RESTORE_ALL_PRESETS = "restore_all_presets"
 
 # Service field names
 FIELD_PRESET = "preset"
@@ -24,6 +25,7 @@ FIELD_STATION_ID = "station_id"
 FIELD_STREAM_URL = "stream_url"
 FIELD_NAME = "name"
 FIELD_ART_URL = "art_url"
+FIELD_CONFIRM = "confirm"
 
 # SoundCork source types
 SOURCE_TUNEIN = "TUNEIN"

@@ -345,22 +345,48 @@ class SoundCorkCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """
-        Fetch all speaker states via REST.
+        Fetch all speaker states via REST - staggered to protect speakers.
         Called every SCAN_INTERVAL_SECONDS as a safety net.
         Real-time updates come from WebSocket listeners above.
+
+        Staggering: 1.5s delay between each speaker prevents connection
+        exhaustion on the SoundTouch 10 tiny HTTP server (max 2-3 connections).
+        Presets only fetched every 5th poll since they rarely change.
         """
         try:
             if not self.speakers:
                 self.speakers = await self._fetch_speakers()
 
+            # Track poll count to reduce preset fetch frequency
+            if not hasattr(self, "_poll_count"):
+                self._poll_count = 0
+            self._poll_count += 1
+            fetch_presets_this_poll = (self._poll_count % 5 == 1)
+
             data: dict[str, Any] = {}
-            for speaker in self.speakers:
+            for i, speaker in enumerate(self.speakers):
                 ip = speaker["ipAddress"]
-                now_playing, volume, presets = await asyncio.gather(
-                    self._fetch_now_playing(ip),
-                    self._fetch_volume(ip),
-                    self._fetch_presets(ip),
-                )
+
+                # Stagger polls: 1.5s between each speaker
+                # Prevents all 8 speakers being hit simultaneously
+                if i > 0:
+                    await asyncio.sleep(1.5)
+
+                # Fetch now-playing and volume concurrently (same speaker, safe)
+                if fetch_presets_this_poll:
+                    now_playing, volume, presets = await asyncio.gather(
+                        self._fetch_now_playing(ip),
+                        self._fetch_volume(ip),
+                        self._fetch_presets(ip),
+                    )
+                else:
+                    now_playing, volume = await asyncio.gather(
+                        self._fetch_now_playing(ip),
+                        self._fetch_volume(ip),
+                    )
+                    # Preserve existing preset data if we have it
+                    presets = (self.data or {}).get(ip, {}).get("presets", [])
+
                 data[ip] = {
                     "speaker": speaker,
                     "now_playing": now_playing,

@@ -275,6 +275,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     ));
   }
 
+  _getTargetIps() {
+    if (this._selectedSpeakers && this._selectedSpeakers.length > 0) {
+      return this._selectedSpeakers.map(id => this._hass && this._hass.states[id] && this._hass.states[id].attributes.ip_address).filter(Boolean);
+    }
+    return this._getSpeakerIps();
+  }
+
+  _getSpeakerNames() {
+    return this._speakers.map(id => {
+      const state = this._hass && this._hass.states[id];
+      return { id, name: state ? (state.attributes.friendly_name || id.split(".")[1]) : id.split(".")[1] };
+    });
+  }
+
   async _setVolumeAll(vol) {
     const xml = `<volume>${vol}</volume>`;
     await Promise.all(this._getSpeakerIps().map(ip =>
@@ -301,64 +315,21 @@ class SoundcorkPresetEditor extends HTMLElement {
     await this._playWithZone(xml);
   }
 
-  async _storePresetOnSpeakers(ips, xml) {
-    // Write a preset to every target speaker with a bounded per-request timeout
-    // and one retry, and report back exactly which IPs succeeded vs failed.
-    //
-    // Root cause (found 2026-08-15): the three save flows below used to run
-    // `fetch(...).catch(()=>{})` in a plain for-loop with NO timeout, only
-    // incrementing a numeric `ok` counter. A single slow/flaky speaker (e.g.
-    // the known Pooptown/Jefe Negro wifi reliability issue) could hang or
-    // silently fail its fetch, and the only visible symptom was a generic
-    // "Saved to 6/8 speakers" message (or, if the speaker had already been
-    // filtered out earlier by _getSpeakerIps as unavailable, no indication
-    // at all - the success message just said "Preset saved" with no count).
-    // Either way there was no way to tell WHICH speakers were skipped without
-    // manually checking each one, which is how the Radio LaB test silently
-    // missed Pooptown and Downstairs. This now names the failures explicitly.
-    const succeeded = [];
-    const failed = [];
-    for (const ip of ips) {
-      let done = false;
-      for (let attempt = 0; attempt < 2 && !done; attempt++) {
-        try {
-          const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, {
-            method: "POST",
-            headers: { "Content-Type": "application/xml" },
-            body: xml,
-            signal: AbortSignal.timeout(8000),
-          });
-          if (r.status < 400) { succeeded.push(ip); done = true; }
-        } catch (e) { /* network error or timeout - fall through to retry */ }
-      }
-      if (!done) failed.push(ip);
-    }
-    return { succeeded, failed };
-  }
-
-    async _savePandoraPreset(station) {
+  async _savePandoraPreset(station) {
     if (this._saving) return;
-    const slot = this._selectedSlot;
-    const ips = this._getSpeakerIps();
-    if (!ips.length) { this._message = "No speakers reachable"; this._render(); return; }
-    if (!this._confirmWrite(slot, station.name, ips)) return;
     this._saving = true; this._message = null; this._render();
-    const xml = `<preset id="${slot}"><ContentItem source="PANDORA" location="${station.location}" sourceAccount="${station.sourceAccount}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(station.art)}</containerArt></ContentItem></preset>`;
-    const { succeeded, failed } = await this._storePresetOnSpeakers(ips, xml);
+    const xml = `<preset id="${this._selectedSlot}"><ContentItem source="PANDORA" location="${station.location}" sourceAccount="${station.sourceAccount}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(station.art)}</containerArt></ContentItem></preset>`;
+    const ips = this._getSpeakerIps();
+    let ok = 0;
+    for (const ip of ips) {
+      try { const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, { method:'POST', headers:{'Content-Type':'application/xml'}, body:xml }); if(r.status<400) ok++; } catch(_) {}
+    }
+    this._message = ok===ips.length ? `Preset ${this._selectedSlot} saved: ${station.name}` : `Saved to ${ok}/${ips.length} speakers`;
     this._saving = false;
     await this._loadPresets();
-    if (!failed.length) {
-      this._message = `Preset ${slot} saved: ${station.name}`;
-      this._render();
-      this._offerUndo(succeeded);
-    } else {
-      const failedNames = this._targetSpeakerNames(failed);
-      this._message = `Saved to ${succeeded.length}/${ips.length} speakers - FAILED: ${failedNames.join(", ")}`;
-      this._render();
-      setTimeout(() => { this._message=null; this._render(); }, 8000);
-    }
+    this._render();
+    setTimeout(() => { this._message=null; this._render(); }, 4000);
   }
-
 
   async _search(query) {
     if (!query.trim()) return;
@@ -377,12 +348,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._loading = false; this._render();
   }
 
-    async _savePreset(station) {
+  async _savePreset(station) {
     if (this._saving) return;
-    const slot = this._selectedSlot;
-    const ips = this._getTargetIps();
-    if (!ips.length) { this._message = "No target speakers reachable/selected"; this._render(); return; }
-    if (!this._confirmWrite(slot, station.name, ips)) return;
     this._saving = true; this._message = null; this._render();
     let artUrl = station.image || "";
     try {
@@ -391,107 +358,17 @@ class SoundcorkPresetEditor extends HTMLElement {
     } catch(_) {}
     const isPodcast = station.guide_id && station.guide_id.startsWith("p");
     const location = isPodcast ? `/v1/playback/show/${station.guide_id}` : `/v1/playback/station/${station.guide_id}`;
-    const xml = `<preset id="${slot}"><ContentItem source="TUNEIN" type="stationurl" location="${location}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(artUrl)}</containerArt></ContentItem></preset>`;
-    const { succeeded, failed } = await this._storePresetOnSpeakers(ips, xml);
-    this._saving = false;
-    await this._loadPresets();
-    if (!failed.length) {
-      this._message = `Preset ${slot} saved: ${station.name} (TuneIn - Bose's TuneIn backend is unreliable, verify it actually plays)`;
-      this._render();
-      this._offerUndo(succeeded);
-    } else {
-      const failedNames = this._targetSpeakerNames(failed);
-      this._message = `Saved to ${succeeded.length}/${ips.length} speakers - FAILED: ${failedNames.join(", ")}`;
-      this._render();
-      setTimeout(() => { this._message=null; this._render(); }, 8000);
-    }
-  }
-
-
-  _targetSpeakerNames(ips) {
-    const names = this._getSpeakerNames();
-    return ips.map(ip => {
-      const match = this._speakers.find(id => {
-        const s = this._hass && this._hass.states[id];
-        return s && s.attributes.ip_address === ip;
-      });
-      const n = names.find(x => x.id === match);
-      return n ? n.name : ip;
-    });
-  }
-
-  _confirmWrite(slot, newName, ips) {
-    const targetNames = this._targetSpeakerNames(ips);
-    const current = this._currentPresets.find(p => p.id === slot);
-    const currentName = current ? current.name : "(empty)";
-    const speakerLabel = ips.length > 1 ? `${ips.length} speakers (${targetNames.join(", ")})` : (targetNames[0] || ips[0]);
-    let msg = `Replace preset ${slot} on ${speakerLabel}?\n\nCurrently: ${currentName}\nNew: ${newName}`;
-    // Surface any speaker that was silently dropped from `ips` before we ever
-    // got here (unavailable in HA, or missing an ip_address attribute) - this
-    // is the pre-flight half of the 2026-08-15 "saved to 6/8 speakers" bug.
-    // Without this, a speaker excluded by _getSpeakerIps()/_getTargetIps()
-    // never showed up anywhere: the confirm dialog and success message both
-    // only ever knew about the already-filtered `ips` list.
-    const requestedIds = (this._selectedSpeakers && this._selectedSpeakers.length > 0) ? this._selectedSpeakers : this._speakers;
-    const excludedIds = requestedIds.filter(id => {
-      const s = this._hass && this._hass.states[id];
-      const ip = s && s.attributes.ip_address;
-      return !ip || !ips.includes(ip);
-    });
-    if (excludedIds.length) {
-      const excludedNames = excludedIds.map(id => {
-        const s = this._hass && this._hass.states[id];
-        return s ? (s.attributes.friendly_name || id.split(".")[1]) : id.split(".")[1];
-      });
-      msg += `\n\nWARNING: skipping ${excludedNames.join(", ")} (unavailable right now) - preset will NOT be updated there.`;
-    }
-    return window.confirm(msg);
-  }
-
-  async _restoreLastBackup(ips) {
+    const xml = `<preset id="${this._selectedSlot}"><ContentItem source="TUNEIN" type="stationurl" location="${location}" isPresetable="true"><itemName>${this._esc(station.name)}</itemName><containerArt>${this._esc(artUrl)}</containerArt></ContentItem></preset>`;
+    const ips = this._getTargetIps();
     let ok = 0;
     for (const ip of ips) {
-      try {
-        const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/presets/restore`, { method:"POST", headers:{"Content-Type":"application/json"}, body:"{}" });
-        if (r.ok) ok++;
-      } catch(_) {}
+      try { const r = await fetch(`${this._baseUrl}/api/v1/speakers/${ip}/store-preset`, { method:"POST", headers:{"Content-Type":"application/xml"}, body:xml }); if(r.status<400) ok++; } catch(_) {}
     }
-    this._message = ok === ips.length ? `Undone - restored previous presets on ${ok} speaker${ok===1?"":"s"}` : `Restored ${ok}/${ips.length} speakers`;
-    await this._loadPresets();
-    this._render();
-    setTimeout(() => { this._message=null; this._render(); }, 5000);
-  }
-
-  _offerUndo(ips) {
-    this._message = `${this._message || "Saved."} <button class="undo-link" id="undo-btn">Undo</button>`;
-    this._render();
-    const btn = this.shadowRoot.getElementById("undo-btn");
-    btn?.addEventListener("click", () => this._restoreLastBackup(ips));
-    setTimeout(() => { this._message=null; this._render(); }, 15000);
-  }
-
-  async _saveRadioPreset(name, streamUrl, artUrl) {
-    if (this._saving) return;
-    const slot = this._selectedSlot;
-    const ips = this._getTargetIps();
-    if (!ips.length) { this._message = "No target speakers reachable/selected"; this._render(); return; }
-    if (!streamUrl || !streamUrl.trim()) { this._message = "Stream URL is required"; this._render(); return; }
-    if (!this._confirmWrite(slot, name || streamUrl, ips)) return;
-    this._saving = true; this._message = null; this._render();
-    const xml = `<preset id="${slot}"><ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" location="${this._esc(streamUrl.trim())}" isPresetable="true"><itemName>${this._esc(name || streamUrl)}</itemName><containerArt>${this._esc(artUrl||"")}</containerArt></ContentItem></preset>`;
-    const { succeeded, failed } = await this._storePresetOnSpeakers(ips, xml);
+    this._message = ok===ips.length ? `? Preset ${this._selectedSlot} saved: ${station.name}` : `?? Saved to ${ok}/${ips.length} speakers`;
     this._saving = false;
     await this._loadPresets();
-    if (!failed.length) {
-      this._message = `Preset ${slot} saved: ${name || streamUrl}`;
-      this._render();
-      this._offerUndo(succeeded);
-    } else {
-      const failedNames = this._targetSpeakerNames(failed);
-      this._message = `Saved to ${succeeded.length}/${ips.length} speakers - FAILED: ${failedNames.join(", ")}`;
-      this._render();
-      setTimeout(() => { this._message=null; this._render(); }, 8000);
-    }
+    this._render();
+    setTimeout(() => { this._message=null; this._render(); }, 4000);
   }
 
   _esc(s) { return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
@@ -594,9 +471,6 @@ class SoundcorkPresetEditor extends HTMLElement {
     .pandora-btns{display:flex;gap:6px;flex-shrink:0}
     .play-btn{padding:5px 10px;border-radius:6px;border:none;background:rgba(3,169,244,.2);color:var(--primary-color);font-size:12px;font-weight:600;cursor:pointer}
     .play-btn:hover{background:rgba(3,169,244,.35)}
-    .warn-banner{background:rgba(255,150,0,.12);border:1px solid rgba(255,150,0,.35);color:var(--primary-text-color);font-size:11px;line-height:1.5;padding:8px 10px;border-radius:8px;margin-bottom:10px}
-    .undo-link{background:none;border:1px solid currentColor;color:inherit;border-radius:6px;padding:2px 8px;margin-left:8px;font-size:11px;cursor:pointer;font-weight:700}
-    .undo-link:hover{opacity:.8}
   `; }
 
   _renderSpeaker() {
@@ -708,47 +582,6 @@ class SoundcorkPresetEditor extends HTMLElement {
       const doPlay = () => { const u = urlInput.value.trim(); if (u) this._playPodcast(u); };
       playBtn?.addEventListener('click', doPlay);
       urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') doPlay(); });
-      return;
-    }
-    if (this._mode === "radio") {
-      const speakerNames = this._getSpeakerNames();
-      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
-      const chipsHtml = this._currentPresets.length
-        ? this._currentPresets.map(p => `<div class="chip ${this._selectedSlot===p.id?'active':''}" data-slot="${p.id}">${p.art?`<img src="${p.art}" alt=""/>`:''}  <span>${p.id}. ${p.name}</span></div>`).join('')
-        : Array.from({length:6},(_,i)=>`<div class="chip ${this._selectedSlot===i+1?'active':''}" data-slot="${i+1}"><span>${i+1}. --</span></div>`).join('');
-      const spkChipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected?'active':'') + '" data-spk="all">All</span>' +
-        speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
-      this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="card">
-        <h3>Direct Stream Preset</h3>
-        <div class="warn-banner">Recommended over TuneIn search: Bose's TuneIn backend was shut down, so TuneIn-sourced presets can silently stop working later. Paste a direct audio stream URL here instead - it plays straight from the source, no Bose lookup involved.</div>
-        <div class="chips">${chipsHtml}</div>
-        ${spkChipsHtml}
-        ${this._message?`<div class="message">${this._message}</div>`:''}
-        <div class="search-row"><input class="search-input" id="radio-name" type="text" placeholder="Station name (e.g. WUWM)"/></div>
-        <div class="search-row"><input class="search-input" id="radio-url" type="text" placeholder="Direct stream URL (e.g. https://.../stream.mp3)" spellcheck="false" autocomplete="off"/></div>
-        <div class="search-row"><input class="search-input" id="radio-art" type="text" placeholder="Artwork URL (optional)" spellcheck="false" autocomplete="off"/></div>
-        <button class="search-btn" id="radio-save" ${this._saving?'disabled':''}>${this._saving?'Saving...':`Save to preset ${this._selectedSlot}`}</button>
-      </div></ha-card>`;
-      this.shadowRoot.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => { this._selectedSlot=parseInt(c.dataset.slot); this._render(); }));
-      this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
-        chip.addEventListener('click', () => {
-          const spk = chip.dataset.spk;
-          if (spk === 'all') { this._selectedSpeakers = null; }
-          else {
-            if (!this._selectedSpeakers) this._selectedSpeakers = [];
-            const idx = this._selectedSpeakers.indexOf(spk);
-            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (!this._selectedSpeakers.length) this._selectedSpeakers = null; }
-            else { this._selectedSpeakers.push(spk); }
-          }
-          this._render();
-        });
-      });
-      const nameInput = this.shadowRoot.getElementById('radio-name');
-      const urlInput2 = this.shadowRoot.getElementById('radio-url');
-      const artInput = this.shadowRoot.getElementById('radio-art');
-      this.shadowRoot.getElementById('radio-save')?.addEventListener('click', () => {
-        this._saveRadioPreset(nameInput.value.trim(), urlInput2.value.trim(), artInput.value.trim());
-      });
       return;
     }
     if (this._mode === "pandora") {
@@ -865,10 +698,7 @@ class SoundcorkPresetEditor extends HTMLElement {
           </div>
           ${!r.unsupported?`<button class="save-btn" data-guide="${r.guide_id}" data-name="${this._esc(r.name)}" data-image="${this._esc(r.image)}">${this._saving?"...":"Save"}</button>`:""}
         </div>`).join("") : `<div class="empty">Search for a radio station to replace preset ${this._selectedSlot}</div>`;
-      const speakerNamesEd = this._getSpeakerNames();
-      const allSelectedEd = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
-      const spkChipsHtmlEd = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelectedEd?'active':'') + '" data-spk="all">All</span>' + speakerNamesEd.map(s => '<span class="spk-chip ' + (!allSelectedEd && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
-      body = `<div class="card"><h3>TuneIn Preset Editor</h3><div class="warn-banner">Bose's TuneIn backend was shut down - a search result may still fail to play even if not marked "not supported". For anything important, use the Direct Stream card instead.</div>${spkChipsHtmlEd}<div class="chips">${chips}</div><div class="search-row"><input class="search-input" id="si" type="text" placeholder="Search TuneIn (e.g. WUWM, jazz, NPR)"/><button class="search-btn" id="sb" ${this._loading?"disabled":""}>${this._loading?"...":"Search"}</button></div>${this._message?`<div class="message">${this._message}</div>`:""}<div class="results">${results}</div></div>`;
+      body = `<div class="card"><h3>TuneIn Preset Editor</h3><div class="chips">${chips}</div><div class="search-row"><input class="search-input" id="si" type="text" placeholder="Search TuneIn (e.g. WUWM, jazz, NPR)"/><button class="search-btn" id="sb" ${this._loading?"disabled":""}>${this._loading?"...":"Search"}</button></div>${this._message?`<div class="message">${this._message}</div>`:""}<div class="results">${results}</div></div>`;
     }
     this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card>${body}</ha-card>`;
     if (p) {
@@ -908,19 +738,6 @@ class SoundcorkPresetEditor extends HTMLElement {
       vs?.addEventListener("change", () => this._setVolumeAll(parseInt(vs.value)));
     } else {
       this.shadowRoot.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => { this._selectedSlot=parseInt(c.dataset.slot); this._render(); }));
-      this.shadowRoot.querySelectorAll(".spk-chip").forEach(chip => {
-        chip.addEventListener("click", () => {
-          const spk = chip.dataset.spk;
-          if (spk === "all") { this._selectedSpeakers = null; }
-          else {
-            if (!this._selectedSpeakers) this._selectedSpeakers = [];
-            const idx = this._selectedSpeakers.indexOf(spk);
-            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (this._selectedSpeakers.length === 0) this._selectedSpeakers = null; }
-            else { this._selectedSpeakers.push(spk); }
-          }
-          this._render();
-        });
-      });
       const si = this.shadowRoot.getElementById("si"), sb = this.shadowRoot.getElementById("sb");
       sb?.addEventListener("click", () => this._search(si.value));
       si?.addEventListener("keydown", e => { if(e.key==="Enter") this._search(si.value); });

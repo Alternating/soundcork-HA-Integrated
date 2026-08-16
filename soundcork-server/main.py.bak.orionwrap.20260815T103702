@@ -1695,83 +1695,6 @@ _PRESET_BACKUP_KEEP = 30  # snapshots kept per speaker
 _PRESET_WRITE_PACING_SECONDS = 0.6
 _PRESET_SPEAKER_PACING_SECONDS = 1.0
 
-import base64 as _base64
-
-def _wrap_local_internet_radio_content_item(preset_elem: ET.Element) -> None:
-    """
-    Root cause (found 2026-08-15): Presets.xml and on-device preset backups
-    store LOCAL_INTERNET_RADIO/stationurl presets with a bare external
-    stream URL in `location` (e.g. https://wmse.streamguys1.com/wmseliveaac).
-    That is NOT what the speaker firmware actually needs to stream
-    reliably -- the webui's own "Save Preset" flow (app.js, ~line 1487)
-    instead points `location` back at soundcork's own
-    /core02/svc-bmx-adapter-orion/prod/orion/station proxy, with
-    {name, imageUrl, streamUrl} base64-encoded as the `data` query param.
-    A preset written with the bare URL still returns 200 from storePreset
-    and looks structurally fine, but the speaker never reports
-    playStatus=PLAY_STATE for it and does not reliably play.
-
-    api_restore_preset_backup / api_restore_all_from_baseline used to push
-    the raw Presets.xml/backups location straight through, skipping this
-    wrapping entirely -- that's what silently broke playback for every
-    preset those two endpoints touched tonight. This wraps LOCAL_INTERNET_
-    RADIO/stationurl presets the same way the webui does, in place, before
-    the preset is sent to storePreset. No-op for anything already wrapped
-    or any other source type.
-    """
-    content_item = preset_elem.find("ContentItem")
-    if content_item is None:
-        return
-    if content_item.attrib.get("source") != "LOCAL_INTERNET_RADIO":
-        return
-    if content_item.attrib.get("type") != "stationurl":
-        return
-    location = content_item.attrib.get("location", "")
-    if not location or "/core02/svc-bmx-adapter-orion/" in location:
-        return
-    item_name = (content_item.findtext("itemName") or "").strip()
-    container_art = (content_item.findtext("containerArt") or "").strip()
-    payload = _base64.b64encode(
-        _json.dumps({"name": item_name, "imageUrl": container_art, "streamUrl": location}).encode()
-    ).decode()
-    content_item.set(
-        "location",
-        f"{settings.base_url}/core02/svc-bmx-adapter-orion/prod/orion/station?data={payload}",
-    )
-
-
-_STORE_PRESET_GLOBAL_LOCK = asyncio.Lock()
-_STORE_PRESET_MIN_INTERVAL_SECONDS = 1.0
-_last_store_preset_at = {"t": 0.0}
-
-
-async def _pace_store_preset_globally():
-    """
-    Serialize + pace EVERY storePreset write through one choke point,
-    regardless of which speaker it targets or which client issued it
-    (webui, HA integration, lovelace card, our own restore endpoints).
-
-    Root-caused twice on 2026-08-15: an unpaced burst of storePreset
-    writes -- even just one write per speaker, fired back-to-back across
-    *different* speakers with no gap -- corrupted TheDeck's and Seven's
-    entire onboard preset stores (not just the slot being written). The
-    restore endpoints already paced their own internal writes, but
-    api_store_preset (used directly by the webui, HA's store_preset_radio/
-    store_preset_tunein services, and the "TuneIn Preset Editor" lovelace
-    card's per-speaker save loop) had no pacing at all -- so any of those
-    callers broadcasting a save to "All" speakers could still reproduce
-    the original incident. This makes api_store_preset itself safe no
-    matter what calls it, instead of relying on every caller to pace
-    itself correctly.
-    """
-    async with _STORE_PRESET_GLOBAL_LOCK:
-        loop = asyncio.get_event_loop()
-        now = loop.time()
-        wait = _STORE_PRESET_MIN_INTERVAL_SECONDS - (now - _last_store_preset_at["t"])
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_store_preset_at["t"] = loop.time()
-
 
 def _preset_backup_dir_for(ip: str) -> str:
     d = os.path.join(_PRESET_BACKUP_DIR, ip.replace(":", "_"))
@@ -1814,7 +1737,6 @@ async def api_store_preset(ip: str, request: Request):
     POST /api/v1/speakers/{ip}/presets/restore.
     """
     body = await request.body()
-    await _pace_store_preset_globally()
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
             await _snapshot_speaker_presets(client, ip)
@@ -1890,7 +1812,6 @@ async def api_restore_preset_backup(ip: str, request: Request):
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
             for preset in root.findall("preset"):
-                _wrap_local_internet_radio_content_item(preset)
                 preset_xml = ET.tostring(preset, encoding="unicode")
                 r = await client.post(
                     _speaker_url(ip, "/storePreset"),
@@ -1954,7 +1875,6 @@ async def api_restore_all_from_baseline(request: Request):
                 continue
             await _snapshot_speaker_presets(client, ip)
             for preset in preset_elems:
-                _wrap_local_internet_radio_content_item(preset)
                 preset_xml = ET.tostring(preset, encoding="unicode")
                 try:
                     r = await client.post(
