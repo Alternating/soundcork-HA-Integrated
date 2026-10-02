@@ -30,6 +30,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._podcastEpisodes = [];
     this._podcastEpisodesLoading = false;
     this._podcastFavorites = [];
+    this._tiPopular = [];
     this._pkShows = [];
     this._pkFilter = '';
     this._pkView = 'list';
@@ -53,7 +54,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (!this._initialized) {
       this._initialized = true;
       if (this._mode === "pandora") { this._loadPandora(); this._loadPresets(); }
-      else if (this._mode === "podcast") { this._loadPodcastFavorites(); }
+      else if (this._mode === "podcast") { this._loadPodcastFavorites(); this._loadTuneinPopular(); }
       else if (this._mode === "pushkin") { this._loadPushkin(); }
       else if (this._mode !== "speaker") { this._loadPresets(); }
     }
@@ -721,6 +722,14 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._render();
   }
 
+  async _loadTuneinPopular() {
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/tunein/popular`, {signal: AbortSignal.timeout(25000)})).json();
+      this._tiPopular = data.shows || [];
+    } catch(e) { console.warn('SoundCork: tunein popular failed', e); }
+    this._render();
+  }
+
   _isFavorite(guideId) { return this._podcastFavorites.some(f => f.guide_id === guideId); }
 
   async _toggleFavorite(item) {
@@ -1035,6 +1044,15 @@ class SoundcorkPresetEditor extends HTMLElement {
               </div>`).join('');
           }
         } else if (this._podcastQuery && !this._podcastSearching) resultsHtml = '<div class="empty">No results</div>';
+        else if (this._tiPopular.length) {
+          resultsHtml = '<div class="pandora-acct-header">Popular Shows</div>' + this._tiPopular.map((s, i) => `
+              <div class="result">
+                <div class="result-art">${s.image?`<img src="${this._esc(s.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
+                <div class="result-info"><div class="result-name">${this._esc(s.name)}</div></div>
+                <button class="fav-btn ${this._isFavorite(s.guide_id)?'active':''} pop-fav" data-i="${i}" title="Favorite">${this._isFavorite(s.guide_id)?'&#x2665;':'&#x2661;'}</button>
+                <div class="pandora-btns"><button class="play-btn pop-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6;</button><button class="play-btn pop-eps" data-i="${i}">Episodes</button></div>
+              </div>`).join('');
+        }
         bodyHtml = `
           ${favsHtml}
           <div class="search-row">
@@ -1093,6 +1111,9 @@ class SoundcorkPresetEditor extends HTMLElement {
         this.shadowRoot.querySelectorAll('.show-fav').forEach(b => b.addEventListener('click', () => { const s = this._podcastShows[parseInt(b.dataset.i)]; if (s) this._toggleFavorite(s); }));
         this.shadowRoot.querySelectorAll('.st-fav').forEach(b => b.addEventListener('click', () => { const s = this._podcastStations[parseInt(b.dataset.i)]; if (s) this._toggleFavorite(s); }));
         this.shadowRoot.querySelectorAll('.st-play').forEach(b => b.addEventListener('click', () => { const s = this._podcastStations[parseInt(b.dataset.i)]; if (s && !s.unsupported) this._playGuideId(s.guide_id, s.name, s.image); }));
+        this.shadowRoot.querySelectorAll('.pop-fav').forEach(b => b.addEventListener('click', () => { const s = this._tiPopular[parseInt(b.dataset.i)]; if (s) this._toggleFavorite(s); }));
+        this.shadowRoot.querySelectorAll('.pop-play').forEach(b => b.addEventListener('click', () => { const s = this._tiPopular[parseInt(b.dataset.i)]; if (s) this._playGuideId(s.guide_id, s.name, s.image); }));
+        this.shadowRoot.querySelectorAll('.pop-eps').forEach(b => b.addEventListener('click', () => { const s = this._tiPopular[parseInt(b.dataset.i)]; if (s) this._openEpisodes(s); }));
         const urlInput = this.shadowRoot.getElementById('podcast-url');
         const playBtn = this.shadowRoot.getElementById('podcast-play');
         const doPlay = () => { const u = urlInput.value.trim(); if (u) this._playPodcast(u); };

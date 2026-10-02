@@ -2504,6 +2504,68 @@ async def api_tunein_episodes(id: str):
     return {"show_id": id, "episodes": episodes}
 
 
+_TUNEIN_POPULAR_TTL_SECONDS = 6 * 3600.0
+_tunein_popular_cache = {"shows": None, "at": 0.0}
+
+
+@app.get("/api/v1/tunein/popular", tags=["soundcork-api"])
+async def api_tunein_popular():
+    """Popular podcast shows, from tunein.com's own podcasts-page rails.
+
+    The OPML API has no global popular-podcasts endpoint (checked
+    2026-10-03: Browse c=popular returns radio stations, and the web
+    rail collection ids come back empty through Browse.ashx), so this
+    reads the web app's INITIAL_STATE JSON -- preferring the "Top
+    Podcasts in Your Area" rail -- cached 6h.
+    """
+    loop = asyncio.get_event_loop()
+    if _tunein_popular_cache["shows"] and loop.time() - _tunein_popular_cache["at"] < _TUNEIN_POPULAR_TTL_SECONDS:
+        return {"shows": _tunein_popular_cache["shows"]}
+    try:
+        async with _httpx.AsyncClient(
+            timeout=20.0, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+        ) as client:
+            r = await client.get("https://tunein.com/podcasts/")
+            html = r.text
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"tunein.com fetch failed: {e}")
+    m = re.search(r"window\.INITIAL_STATE\s*=\s*(\{.*?\});?\s*</script>", html, re.S)
+    if not m:
+        raise HTTPException(status_code=502, detail="tunein.com page format changed (no INITIAL_STATE)")
+    try:
+        state = _json.loads(m.group(1))
+        containers = state["categories"]["c100000088"]["containers"]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"tunein.com page parse failed: {e}")
+
+    def rail_shows(container):
+        out = []
+        for child in container.get("children", []):
+            gid = child.get("guideId") or ""
+            name = child.get("title") or (child.get("seoInfo") or {}).get("title") or ""
+            if gid.startswith("p") and name:
+                out.append({"guide_id": gid, "name": name, "image": child.get("image", "")})
+        return out
+
+    shows = []
+    for c in containers:
+        if (c.get("title") or "").lower().startswith("top podcasts"):
+            shows = rail_shows(c)
+            break
+    if len(shows) < 5:
+        for c in containers:
+            s = rail_shows(c)
+            if len(s) >= 8:
+                shows = s
+                break
+    if not shows:
+        raise HTTPException(status_code=502, detail="no podcast rails found on tunein.com")
+    _tunein_popular_cache["shows"] = shows
+    _tunein_popular_cache["at"] = loop.time()
+    return {"shows": shows}
+
+
 def _orion_station_location(name: str, image_url: str, stream_url: str) -> str:
     """Wrap an arbitrary stream URL the way the webui wraps LOCAL_INTERNET_RADIO
     presets: base64 {name,imageUrl,streamUrl} through the orion bmx adapter."""
@@ -2835,7 +2897,9 @@ async def api_pushkin_shows():
         name = re.sub(r"\s+", " ", name).strip()
         if name and slug not in shows:
             shows[slug] = {"slug": slug, "name": name}
-    result = sorted(shows.values(), key=lambda s: s["name"].lower())
+    # Keep pushkin.fm's own page order -- it's editorial (flagship shows
+    # first), which is the closest thing Pushkin has to a popularity rank.
+    result = list(shows.values())
     if result:
         _pushkin_cache["shows"] = result
         _pushkin_cache["at"] = loop.time()
