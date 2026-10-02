@@ -2643,3 +2643,155 @@ async def api_play_podcast(request: Request):
         "play_confirmed": confirmed,
         "stream_url": stream_url,
     }
+
+
+# ---------------------------------------------------------------------------
+# Server-side group playback orchestration
+# The browser makes ONE fire-and-forget call; the server runs the full
+# sequence (clear zones -> play master -> confirm PLAY_STATE -> zone slaves)
+# so playback is immune to the browser tab closing or the phone locking.
+# ---------------------------------------------------------------------------
+
+_PREFERRED_MASTER_IP = "192.168.1.214"  # Kitchen - always-on interior speaker
+
+
+async def _probe_reachable(client: "_httpx.AsyncClient", ip: str) -> bool:
+    try:
+        r = await client.get(_speaker_url(ip, "/nowPlaying"), timeout=2.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _wait_for_play_state(client: "_httpx.AsyncClient", ip: str, polls: int = 20) -> bool:
+    for _ in range(polls):
+        await asyncio.sleep(0.5)
+        try:
+            r = await client.get(_speaker_url(ip, "/nowPlaying"), timeout=2.0)
+            if b"PLAY_STATE" in r.content:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _clear_zone_quiet(client: "_httpx.AsyncClient", ip: str) -> None:
+    try:
+        r = await client.get(_speaker_url(ip, "/info"), timeout=3.0)
+        m = None
+        text = r.content.decode("utf-8", errors="ignore")
+        idx = text.find('deviceID="')
+        if idx >= 0:
+            m = text[idx + 10 : text.find('"', idx + 10)]
+        if m:
+            xml = f'<zone master="{m}" senderIPAddress="{ip}"></zone>'
+            await client.post(
+                _speaker_url(ip, "/setZone"),
+                content=xml.encode(),
+                headers={"Content-Type": "application/xml"},
+            )
+    except Exception:
+        pass
+
+
+async def _group_play_task(speakers: list, master_action, slave_action) -> None:
+    """
+    Full orchestration, runs server-side to completion.
+    master_action(client, ip): starts playback on the master.
+    slave_action(client, ip): independent-playback fallback for a slave.
+    """
+    import asyncio as _asyncio
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            # 1. Filter to reachable speakers
+            flags = await _asyncio.gather(*[_probe_reachable(client, s["ip"]) for s in speakers])
+            reachable = [s for s, ok in zip(speakers, flags) if ok]
+            if not reachable:
+                logger.warning("group-play: no reachable speakers")
+                return
+
+            # 2. Clear stale zones everywhere (kills zombie masters)
+            for s in reachable:
+                await _clear_zone_quiet(client, s["ip"])
+            await _asyncio.sleep(0.5)
+
+            # 3. Pick master: Kitchen if selected, else first reachable
+            master = next((s for s in reachable if s["ip"] == _PREFERRED_MASTER_IP), reachable[0])
+            slaves = [s for s in reachable if s["ip"] != master["ip"]]
+
+            # 4. Start playback on master, confirm PLAY_STATE (retry once)
+            await master_action(client, master["ip"])
+            playing = await _wait_for_play_state(client, master["ip"])
+            if not playing:
+                await master_action(client, master["ip"])
+                playing = await _wait_for_play_state(client, master["ip"])
+
+            if not slaves:
+                return
+
+            if playing:
+                # 5. Zone the confirmed-playing master
+                members = "".join(
+                    f'<member ipaddress="{s["ip"]}">{s["device_id"]}</member>' for s in slaves
+                )
+                zone_xml = (
+                    f'<zone master="{master["device_id"]}" senderIPAddress="{master["ip"]}">'
+                    f"{members}</zone>"
+                )
+                await client.post(
+                    _speaker_url(master["ip"], "/setZone"),
+                    content=zone_xml.encode(),
+                    headers={"Content-Type": "application/xml"},
+                )
+                logger.info("group-play: zoned %d slaves to master %s", len(slaves), master["ip"])
+            else:
+                # 6. Fallback: independent playback everywhere
+                logger.warning("group-play: master %s never reached PLAY_STATE, independent fallback", master["ip"])
+                await _asyncio.gather(*[slave_action(client, s["ip"]) for s in slaves])
+    except Exception as e:
+        logger.error("group-play task failed: %s", e)
+
+
+@app.post("/api/v1/preset/play", tags=["soundcork-api"])
+async def api_group_play_preset(request: Request):
+    """
+    Fire-and-forget group preset playback.
+    Body: {"preset_id": 2, "speakers": [{"ip": "...", "device_id": "..."}, ...]}
+    Returns immediately; orchestration continues server-side.
+    """
+    body = await request.json()
+    preset_id = int(body.get("preset_id", 0))
+    speakers = body.get("speakers", [])
+    if not (1 <= preset_id <= 6) or not speakers:
+        raise HTTPException(status_code=400, detail="preset_id (1-6) and speakers are required")
+
+    key = f"PRESET_{preset_id}"
+
+    async def press(client, ip):
+        await _key_press(client, ip, key)
+
+    asyncio.ensure_future(_group_play_task(speakers, press, press))
+    return {"accepted": True, "preset_id": preset_id, "speakers": len(speakers)}
+
+
+@app.post("/api/v1/select/play", tags=["soundcork-api"])
+async def api_group_play_select(request: Request):
+    """
+    Fire-and-forget group ContentItem playback (Pandora, radio, etc.).
+    Body: {"content_item": "<ContentItem .../>", "speakers": [{"ip","device_id"}, ...]}
+    """
+    body = await request.json()
+    content_item = body.get("content_item", "")
+    speakers = body.get("speakers", [])
+    if not content_item or not speakers:
+        raise HTTPException(status_code=400, detail="content_item and speakers are required")
+
+    async def select(client, ip):
+        await client.post(
+            _speaker_url(ip, "/select"),
+            content=content_item.encode(),
+            headers={"Content-Type": "application/xml"},
+        )
+
+    asyncio.ensure_future(_group_play_task(speakers, select, select))
+    return {"accepted": True, "speakers": len(speakers)}
