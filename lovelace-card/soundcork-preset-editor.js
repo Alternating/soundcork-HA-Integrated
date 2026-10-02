@@ -38,6 +38,14 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._pkEpisodes = [];
     this._pkLoading = false;
     this._pkFavorites = [];
+    this._ihFavorites = [];
+    this._ihQuery = '';
+    this._ihSearching = false;
+    this._ihShows = [];
+    this._ihView = 'search';
+    this._ihShow = null;
+    this._ihEpisodes = [];
+    this._ihEpisodesLoading = false;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -56,6 +64,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       if (this._mode === "pandora") { this._loadPandora(); this._loadPresets(); }
       else if (this._mode === "podcast") { this._loadPodcastFavorites(); this._loadTuneinPopular(); }
       else if (this._mode === "pushkin") { this._loadPushkin(); }
+      else if (this._mode === "iheart") { this._loadIheart(); }
       else if (this._mode !== "speaker") { this._loadPresets(); }
     }
     if (this._mode === "speaker" || this._mode === "pandora") this._render();
@@ -968,6 +977,89 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._pkBindShowRows();
   }
 
+  async _loadIheart() {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites?provider=iheart`, {signal: AbortSignal.timeout(5000)});
+      this._ihFavorites = (await r.json()).favorites || [];
+    } catch(e) { console.warn('SoundCork: loadIheart failed', e); }
+    this._render();
+  }
+
+  _ihIsFavorite(id) { return this._ihFavorites.some(f => f.guide_id === id); }
+
+  async _ihToggleFavorite(show) {
+    const id = show.guide_id;
+    try {
+      let r;
+      if (this._ihIsFavorite(id)) {
+        r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites/${id}?provider=iheart`, {method:'DELETE'});
+      } else {
+        r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider:'iheart', guide_id: id, name: show.name, image: show.image || '' })
+        });
+      }
+      this._ihFavorites = (await r.json()).favorites || [];
+    } catch(e) { console.warn('SoundCork: iheart favorite failed', e); }
+    this._render();
+  }
+
+  async _ihSearch(query) {
+    if (!query.trim()) return;
+    this._ihQuery = query;
+    this._ihSearching = true; this._ihShows = []; this._render();
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/iheart/search?q=${encodeURIComponent(query)}`, {signal: AbortSignal.timeout(15000)})).json();
+      this._ihShows = data.shows || [];
+    } catch(e) { console.warn('SoundCork: iheart search failed', e); }
+    this._ihSearching = false; this._render();
+  }
+
+  async _ihOpenEpisodes(show) {
+    this._ihShow = { guide_id: show.guide_id, name: show.name, image: show.image || '' };
+    this._ihView = 'episodes';
+    this._ihEpisodes = [];
+    this._ihEpisodesLoading = true;
+    this._render();
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/iheart/episodes?id=${encodeURIComponent(show.guide_id)}`, {signal: AbortSignal.timeout(25000)})).json();
+      this._ihEpisodes = data.episodes || [];
+      if (data.show) this._ihShow = { guide_id: this._ihShow.guide_id, name: data.show.name || this._ihShow.name, image: data.show.image || this._ihShow.image };
+    } catch(e) { console.warn('SoundCork: iheart episodes failed', e); }
+    this._ihEpisodesLoading = false;
+    this._render();
+  }
+
+  async _ihPlayEpisode(ep, showName, showImage) {
+    this._podcastStatus = {type:'loading', msg:`Resolving: ${ep.title}...`};
+    this._render();
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/iheart/episode-stream?id=${encodeURIComponent(ep.episode_id)}`, {signal: AbortSignal.timeout(15000)});
+      const data = await r.json();
+      if (!r.ok || !data.stream_url) throw new Error(data.detail || 'Could not resolve episode stream');
+      await this._playStreamUrl(data.stream_url, `${showName}: ${ep.title}`, ep.image || data.image || showImage || '');
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg: e.message || 'Could not resolve episode'};
+      this._render();
+      setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+    }
+  }
+
+  async _ihPlayLatest(show) {
+    this._podcastStatus = {type:'loading', msg:`Finding latest episode of ${show.name}...`};
+    this._render();
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/iheart/episodes?id=${encodeURIComponent(show.guide_id)}`, {signal: AbortSignal.timeout(25000)})).json();
+      const ep = (data.episodes || [])[0];
+      if (!ep) throw new Error('No episodes found');
+      await this._ihPlayEpisode(ep, (data.show && data.show.name) || show.name, (data.show && data.show.image) || show.image || '');
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg: e.message || 'Could not find episodes'};
+      this._render();
+      setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+    }
+  }
+
   _render() {
     if (this._mode === "podcast") {
       const speakerNames = this._getSpeakerNames();
@@ -1212,6 +1304,112 @@ class SoundcorkPresetEditor extends HTMLElement {
         this.shadowRoot.querySelectorAll('.pk-fav-play').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkPlayLatest(f); }));
         this.shadowRoot.querySelectorAll('.pk-fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkOpenEpisodes(f); }));
         this.shadowRoot.querySelectorAll('.pk-fav-del').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkToggleFavorite(f); }));
+      }
+      return;
+    }
+    if (this._mode === "iheart") {
+      const speakerNames = this._getSpeakerNames();
+      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
+      const chipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected?'active':'') + '" data-spk="all">All</span>' +
+        speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
+      const statusHtml = this._podcastStatus ? `<div class="podcast-status ${this._podcastStatus.type}">${this._podcastStatus.msg}</div>` : '';
+
+      let bodyHtml;
+      if (this._ihView === 'episodes' && this._ihShow) {
+        const fav = this._ihIsFavorite(this._ihShow.guide_id);
+        const eps = this._ihEpisodesLoading
+          ? '<div class="loading">Loading episodes...</div>'
+          : this._ihEpisodes.length ? this._ihEpisodes.map((ep, i) => `
+            <div class="result">
+              <div class="result-art">${ep.image?`<img src="${this._esc(ep.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
+              <div class="result-info">
+                <div class="result-name">${this._esc(ep.title)}</div>
+                <div class="result-sub">${this._esc(ep.date || '')}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
+              </div>
+              <button class="play-btn ih-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
+            </div>`).join('') : '<div class="empty">No episodes found</div>';
+        bodyHtml = `
+          <div class="ep-header">
+            <button class="back-btn" id="ih-back" title="Back to search">&#x2190;</button>
+            <div class="result-art">${this._ihShow.image?`<img src="${this._esc(this._ihShow.image)}" alt=""/>`:'&#x1F399;'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(this._ihShow.name)}</div><div class="result-sub">Recent episodes</div></div>
+            <button class="fav-btn ${fav?'active':''}" id="ih-fav" title="${fav?'Remove favorite':'Save favorite'}">${fav?'&#x2665;':'&#x2661;'}</button>
+          </div>
+          <div class="results">${eps}</div>`;
+      } else {
+        const favRows = this._ihFavorites.map((f, i) => `
+          <div class="result">
+            <div class="result-art">${f.image?`<img src="${this._esc(f.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(f.name)}</div><div class="result-sub">show</div></div>
+            <div class="pandora-btns"><button class="play-btn ih-fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6; Play</button><button class="play-btn ih-fav-eps" data-i="${i}">Episodes</button></div>
+            <button class="fav-del ih-fav-del" data-i="${i}" title="Remove favorite">&#x2715;</button>
+          </div>`).join('');
+        let resultsHtml;
+        if (this._ihSearching) resultsHtml = '<div class="loading">Searching iHeart...</div>';
+        else if (this._ihShows.length) resultsHtml = this._ihShows.map((s, i) => `
+          <div class="result">
+            <div class="result-art">${s.image?`<img src="${this._esc(s.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(s.name)}</div>${s.description?`<div class="result-sub">${this._esc(s.description)}</div>`:''}</div>
+            <button class="fav-btn ${this._ihIsFavorite(s.guide_id)?'active':''} ih-show-fav" data-i="${i}" title="Favorite">${this._ihIsFavorite(s.guide_id)?'&#x2665;':'&#x2661;'}</button>
+            <div class="pandora-btns"><button class="play-btn ih-show-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6;</button><button class="play-btn ih-show-eps" data-i="${i}">Episodes</button></div>
+          </div>`).join('');
+        else if (this._ihQuery) resultsHtml = '<div class="empty">No results</div>';
+        else resultsHtml = '<div class="empty">Search above to find iHeart shows</div>';
+        bodyHtml = `
+          <div class="pandora-acct-header">iHeart Favorites</div>
+          ${this._ihFavorites.length ? `<div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : '<div class="empty" style="padding:6px 0 12px">No favorites yet - &#x2661; a show below</div>'}
+          <div class="pandora-acct-header">Search iHeart</div>
+          <div class="search-row">
+            <input class="search-input" id="ih-search" type="text" placeholder="Search iHeart podcasts (e.g. Behind the Bastards)" value="${this._esc(this._ihQuery)}"/>
+            <button class="search-btn" id="ih-search-btn" ${this._ihSearching?'disabled':''}>${this._ihSearching?'...':'Search'}</button>
+          </div>
+          <div class="pandora-acct-header">Shows</div>
+          <div class="results">${resultsHtml}</div>`;
+      }
+
+      this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
+        <h3>iHeart-Podcasts</h3>
+        ${chipsHtml}
+        ${statusHtml}
+        ${bodyHtml}
+      </div></ha-card>`;
+
+      this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          const spk = chip.dataset.spk;
+          if (spk === 'all') { this._selectedSpeakers = null; }
+          else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (!this._selectedSpeakers.length) this._selectedSpeakers = null; }
+            else { this._selectedSpeakers.push(spk); }
+          }
+          this._render();
+        });
+      });
+      if (this._ihView === 'episodes' && this._ihShow) {
+        this.shadowRoot.getElementById('ih-back')?.addEventListener('click', () => { this._ihView = 'search'; this._ihShow = null; this._render(); });
+        this.shadowRoot.getElementById('ih-fav')?.addEventListener('click', () => this._ihToggleFavorite(this._ihShow));
+        this.shadowRoot.querySelectorAll('.ih-ep-play').forEach(b => b.addEventListener('click', () => {
+          const ep = this._ihEpisodes[parseInt(b.dataset.i)];
+          if (ep) this._ihPlayEpisode(ep, this._ihShow.name, this._ihShow.image);
+        }));
+      } else {
+        const si = this.shadowRoot.getElementById('ih-search');
+        // Search fires on Enter / the Search button ONLY -- never per
+        // keystroke: a full re-render would destroy the focused input and
+        // bare letters would fall through to HA's global hotkeys (the
+        // quick-bar bug; see the pushkin filter note above). Key events are
+        // swallowed so they never reach HA's handler either.
+        si?.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') this._ihSearch(si.value); });
+        si?.addEventListener('keyup', e => e.stopPropagation());
+        this.shadowRoot.getElementById('ih-search-btn')?.addEventListener('click', () => { if (si) this._ihSearch(si.value); });
+        this.shadowRoot.querySelectorAll('.ih-fav-play').forEach(b => b.addEventListener('click', () => { const f = this._ihFavorites[parseInt(b.dataset.i)]; if (f) this._ihPlayLatest(f); }));
+        this.shadowRoot.querySelectorAll('.ih-fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._ihFavorites[parseInt(b.dataset.i)]; if (f) this._ihOpenEpisodes(f); }));
+        this.shadowRoot.querySelectorAll('.ih-fav-del').forEach(b => b.addEventListener('click', () => { const f = this._ihFavorites[parseInt(b.dataset.i)]; if (f) this._ihToggleFavorite(f); }));
+        this.shadowRoot.querySelectorAll('.ih-show-fav').forEach(b => b.addEventListener('click', () => { const s = this._ihShows[parseInt(b.dataset.i)]; if (s) this._ihToggleFavorite(s); }));
+        this.shadowRoot.querySelectorAll('.ih-show-play').forEach(b => b.addEventListener('click', () => { const s = this._ihShows[parseInt(b.dataset.i)]; if (s) this._ihPlayLatest(s); }));
+        this.shadowRoot.querySelectorAll('.ih-show-eps').forEach(b => b.addEventListener('click', () => { const s = this._ihShows[parseInt(b.dataset.i)]; if (s) this._ihOpenEpisodes(s); }));
       }
       return;
     }

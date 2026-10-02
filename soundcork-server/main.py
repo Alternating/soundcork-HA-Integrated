@@ -3004,6 +3004,186 @@ async def api_pushkin_episodes(show: str):
 
 
 # ---------------------------------------------------------------------------
+# iHeart (us.api.iheart.com)
+# Public, unauthenticated API v3; wants a browser User-Agent. Verified
+# 2026-10-03:
+#   /search/all?...&podcast=true          -> results.podcasts[{id, title,
+#       description, image}] (search calls the artwork "image"; the show
+#       endpoint calls it "imageUrl")
+#   /podcast/podcasts/{id}                -> {id, title, description, imageUrl}
+#   /podcast/podcasts/{id}/episodes?limit -> {data: [{id, title, duration
+#       (already seconds), startDate (epoch MILLISECONDS), imageUrl}]}
+#       -- the list has NO mediaUrl; it must be resolved per episode
+#   /podcast/episodes/{episodeId}         -> {"episode": {..., mediaUrl}}
+#       (payload nests under "episode"; unknown ids return 404
+#       {"error": "..."}).
+# mediaUrl is a podtrac/pscrb/Omny redirect-chain MP3 -- the same technology
+# TuneIn/Pushkin episodes use -- played through the shared
+# _play_wrapped_stream pipeline via /api/v1/play-stream, which pre-follows
+# the redirects for the SoundTouch firmware.
+# ---------------------------------------------------------------------------
+
+from datetime import timezone as _dt_timezone
+
+_IHEART_API = "https://us.api.iheart.com/api/v3"
+_IHEART_ID_RE = r"\d{1,20}"
+_IHEART_TTL_SECONDS = 6 * 3600.0
+_iheart_cache = {"shows": {}}  # show id -> {"show": {...}, "at": loop.time()}
+
+
+def _iheart_date(epoch_ms) -> str:
+    """iHeart startDate (epoch milliseconds) -> 'Oct 1, 2026' ('' if absent)."""
+    try:
+        dt = datetime.fromtimestamp(int(epoch_ms) / 1000.0, tz=_dt_timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return ""
+    return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+
+
+def _iheart_error_detail(resp, fallback: str) -> str:
+    """Pull iHeart's {"error": "..."} message out of an error response."""
+    try:
+        return resp.json().get("error") or fallback
+    except Exception:
+        return fallback
+
+
+@app.get("/api/v1/iheart/search", tags=["soundcork-api"])
+async def api_iheart_search(q: str):
+    """Search iHeart podcasts -> {"shows": [{guide_id, name, description, image}]}.
+
+    guide_id is iHeart's numeric show id, returned as a string so the card
+    and the iheart favorites provider treat it uniformly.
+    """
+    q = (q or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q is required")
+    try:
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(
+                f"{_IHEART_API}/search/all",
+                params={
+                    "keywords": q,
+                    "maxRows": 20,
+                    "podcast": "true",
+                    "station": "false",
+                    "artist": "false",
+                    "track": "false",
+                    "bundle": "false",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+    except _httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"iHeart search failed: HTTP {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"iHeart search failed: {e}")
+    shows = []
+    for p in (data.get("results") or {}).get("podcasts") or []:
+        if p.get("id") is None or not p.get("title"):
+            continue
+        shows.append(
+            {
+                "guide_id": str(p["id"]),
+                "name": p["title"],
+                "description": p.get("description") or p.get("subtitle") or "",
+                "image": p.get("image") or "",
+            }
+        )
+    return {"shows": shows}
+
+
+@app.get("/api/v1/iheart/episodes", tags=["soundcork-api"])
+async def api_iheart_episodes(id: str):
+    """Recent episodes for an iHeart show (numeric id, 50 most recent).
+
+    Returns {"show": {guide_id, name, image}, "episodes": [{episode_id,
+    title, date, duration_seconds, image}]}. The episode list carries no
+    mediaUrl -- playback resolves it per episode via
+    /api/v1/iheart/episode-stream. Show metadata is cached 6h.
+    """
+    if not re.fullmatch(_IHEART_ID_RE, id):
+        raise HTTPException(status_code=400, detail="id must be a numeric iHeart show id like 29236323")
+    loop = asyncio.get_event_loop()
+    cached = _iheart_cache["shows"].get(id)
+    show = cached["show"] if cached and loop.time() - cached["at"] < _IHEART_TTL_SECONDS else None
+    try:
+        async with _httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            if show is None:
+                sr, er = await asyncio.gather(
+                    client.get(f"{_IHEART_API}/podcast/podcasts/{id}"),
+                    client.get(f"{_IHEART_API}/podcast/podcasts/{id}/episodes", params={"limit": 50}),
+                )
+            else:
+                sr = None
+                er = await client.get(f"{_IHEART_API}/podcast/podcasts/{id}/episodes", params={"limit": 50})
+            if er.status_code == 404 or (sr is not None and sr.status_code == 404):
+                bad = er if er.status_code == 404 else sr
+                raise HTTPException(
+                    status_code=404, detail=_iheart_error_detail(bad, f"iHeart show {id} not found")
+                )
+            er.raise_for_status()
+            ep_data = er.json()
+            if show is None:
+                sr.raise_for_status()
+                sd = sr.json()
+                show = {"guide_id": id, "name": sd.get("title") or id, "image": sd.get("imageUrl") or ""}
+                _iheart_cache["shows"][id] = {"show": show, "at": loop.time()}
+    except HTTPException:
+        raise
+    except _httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"iHeart episode list failed: HTTP {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"iHeart episode list failed: {e}")
+    episodes = []
+    for ep in (ep_data.get("data") or [])[:50]:
+        if ep.get("id") is None:
+            continue
+        episodes.append(
+            {
+                "episode_id": str(ep["id"]),
+                "title": ep.get("title") or "",
+                "date": _iheart_date(ep.get("startDate")),
+                "duration_seconds": ep.get("duration"),
+                "image": ep.get("imageUrl") or show["image"],
+            }
+        )
+    return {"show": show, "episodes": episodes}
+
+
+@app.get("/api/v1/iheart/episode-stream", tags=["soundcork-api"])
+async def api_iheart_episode_stream(id: str):
+    """Resolve an iHeart episode id -> {"stream_url", "title", "image"}.
+
+    stream_url is the episode detail's mediaUrl (podtrac/pscrb/Omny redirect
+    chain) -- feed it to /api/v1/play-stream, which pre-follows the chain.
+    404 if iHeart doesn't know the episode or it carries no mediaUrl.
+    """
+    if not re.fullmatch(_IHEART_ID_RE, id):
+        raise HTTPException(status_code=400, detail="id must be a numeric iHeart episode id")
+    try:
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(f"{_IHEART_API}/podcast/episodes/{id}")
+            if r.status_code == 404:
+                raise HTTPException(
+                    status_code=404, detail=_iheart_error_detail(r, f"iHeart episode {id} not found")
+                )
+            r.raise_for_status()
+            data = r.json()
+    except HTTPException:
+        raise
+    except _httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"iHeart episode lookup failed: HTTP {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"iHeart episode lookup failed: {e}")
+    ep = data.get("episode") or {}
+    media_url = (ep.get("mediaUrl") or "").strip()
+    if not media_url:
+        raise HTTPException(status_code=404, detail=f"iHeart episode {id} has no mediaUrl (not playable)")
+    return {"stream_url": media_url, "title": ep.get("title") or "", "image": ep.get("imageUrl") or ""}
+
+
+# ---------------------------------------------------------------------------
 # Server-side group playback orchestration
 # The browser makes ONE fire-and-forget call; the server runs the full
 # sequence (clear zones -> play master -> confirm PLAY_STATE -> zone slaves)
