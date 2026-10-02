@@ -2442,6 +2442,7 @@ _FAVORITE_PROVIDERS = {
     "tunein": r"[pst]\d+",
     "pushkin": r"[a-z0-9-]{1,80}",
     "iheart": r"[A-Za-z0-9_-]{1,80}",
+    "spotify": r"[A-Za-z0-9:_-]{1,120}",
 }
 
 
@@ -2763,42 +2764,25 @@ async def api_play_podcast(request: Request):
     return result
 
 
-async def _play_wrapped_stream(
-    stream_url: str,
-    title: str,
-    image: str,
+async def _select_confirm_zone(
+    content_item_xml: str,
     master_ip: str,
     master_device_id: str,
     slaves: list,
-    resolve_redirects: bool = False,
-) -> dict:
-    """Shared playback pipeline for any provider that yields a direct audio
-    URL (TuneIn, Pushkin, iHeart...): optional redirect pre-resolution, orion
-    wrap, select on master, confirm PLAY_STATE before zoning slaves."""
-    if resolve_redirects:
-        try:
-            async with _httpx.AsyncClient(
-                follow_redirects=True, timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}
-            ) as client:
-                async with client.stream("GET", stream_url) as resp:
-                    stream_url = str(resp.url)
-        except Exception:
-            pass  # fall back to the unresolved URL; the orion proxy may still cope
+) -> bool:
+    """/select a ContentItem on the master, confirm PLAY_STATE, zone slaves.
 
-    location = _orion_station_location(title, image, stream_url)
-    xml = (
-        f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
-        f'location={_xml_quoteattr(location)} isPresetable="false">'
-        f"<itemName>{_xml_escape(title)}</itemName>"
-        f"<containerArt>{_xml_escape(image)}</containerArt>"
-        f"</ContentItem>"
-    )
-
+    Shared by every tile that plays via ContentItem selection -- the orion
+    wrap pipeline (_play_wrapped_stream) and native-source tiles (Spotify).
+    Returns whether the master confirmed PLAY/BUFFERING; zoning an
+    unconfirmed master drops the whole group into INVALID_SOURCE, so
+    unconfirmed masters get independent-playback fallback on each slave.
+    """
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
             await client.post(
                 _speaker_url(master_ip, "/select"),
-                content=xml.encode(),
+                content=content_item_xml.encode(),
                 headers={"Content-Type": "application/xml"},
             )
     except _httpx.ConnectError:
@@ -2840,11 +2824,47 @@ async def _play_wrapped_stream(
                 async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
                     await client.post(
                         _speaker_url(s["ip"], "/select"),
-                        content=xml.encode(),
+                        content=content_item_xml.encode(),
                         headers={"Content-Type": "application/xml"},
                     )
             except Exception:
                 pass
+
+    return confirmed
+
+
+async def _play_wrapped_stream(
+    stream_url: str,
+    title: str,
+    image: str,
+    master_ip: str,
+    master_device_id: str,
+    slaves: list,
+    resolve_redirects: bool = False,
+) -> dict:
+    """Shared playback pipeline for any provider that yields a direct audio
+    URL (TuneIn, Pushkin, iHeart...): optional redirect pre-resolution, orion
+    wrap, select on master, confirm PLAY_STATE before zoning slaves."""
+    if resolve_redirects:
+        try:
+            async with _httpx.AsyncClient(
+                follow_redirects=True, timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}
+            ) as client:
+                async with client.stream("GET", stream_url) as resp:
+                    stream_url = str(resp.url)
+        except Exception:
+            pass  # fall back to the unresolved URL; the orion proxy may still cope
+
+    location = _orion_station_location(title, image, stream_url)
+    xml = (
+        f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
+        f'location={_xml_quoteattr(location)} isPresetable="false">'
+        f"<itemName>{_xml_escape(title)}</itemName>"
+        f"<containerArt>{_xml_escape(image)}</containerArt>"
+        f"</ContentItem>"
+    )
+
+    confirmed = await _select_confirm_zone(xml, master_ip, master_device_id, slaves)
 
     return {
         "success": True,
@@ -3181,6 +3201,268 @@ async def api_iheart_episode_stream(id: str):
     if not media_url:
         raise HTTPException(status_code=404, detail=f"iHeart episode {id} has no mediaUrl (not playable)")
     return {"stream_url": media_url, "title": ep.get("title") or "", "image": ep.get("imageUrl") or ""}
+
+
+# ---------------------------------------------------------------------------
+# Spotify (native speaker source -- NOT the orion proxy pipeline)
+#
+# SoundTouch firmware embeds Spotify's eSDK: the speaker's own client pulls
+# the DRM'd audio, so unlike TuneIn/Pushkin/iHeart we never see a stream URL.
+# This tile drives the speaker's SPOTIFY source via ContentItem /select.
+#
+# ContentItem format (researched 2026-10-02):
+#   - Upstream soundcork (timvw/soundcork) webui stores working Spotify
+#     presets as: <ContentItem source="SPOTIFY" type="tracklisturl"
+#     location="/playback/container/{base64(spotify:URI)}"
+#     sourceAccount="{spotifyUserId}" isPresetable="true"> (app.js ~1305).
+#     Upstream examples/Recents.xml confirms the same shape for recents.
+#   - Our speakers' Sources.xml currently has NO SPOTIFY source (checked
+#     2026-10-02 on 192.168.1.229:/soundcork/data/4365315/Sources.xml), so
+#     sourceAccount cannot be discovered yet; /play returns 409 until a
+#     Spotify account is linked on the speakers (upstream linking flow:
+#     SPOTIFY_CLIENT_ID/SECRET + /mgmt/spotify OAuth + ZeroConf primer).
+#
+# Search/episodes use the Spotify Web API client-credentials flow, which
+# suffices for catalog lookups (no user scope). 2026 Spotify API facts:
+#   - show/episode search and /shows/{id}/episodes REQUIRE an explicit
+#     market param under client-credentials (no user country to infer);
+#     omitting it yields null/empty results.
+#   - tokens last 3600s; cached here until 60s before expiry.
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+_SPOTIFY_API = "https://api.spotify.com/v1"
+_SPOTIFY_MARKET = "US"
+_SPOTIFY_URI_RE = r"spotify:(track|album|playlist|artist|show|episode):[A-Za-z0-9]{22}"
+
+_spotify_cc_token = {"token": None, "expires_at": 0.0}
+_SPOTIFY_ACCOUNT_TTL_SECONDS = 600.0
+_spotify_account_cache = {"account": None, "at": 0.0}
+
+
+def _spotify_configured() -> bool:
+    """Web-API creds present? Read from upstream Settings (env vars
+    SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET -- same vars the upstream
+    OAuth/ZeroConf-primer stack uses, so one pair of creds powers both)."""
+    return bool(settings.spotify_client_id and settings.spotify_client_secret)
+
+
+def _spotify_speaker_account() -> str | None:
+    """sourceAccount for SPOTIFY ContentItems, from the speakers' synced
+    Sources.xml (<sourceKey type="SPOTIFY" account="..."/>). Scans
+    data_dir/*/Sources.xml (per-account dirs like 4365315/) plus the data
+    root; unparseable files (the root copy is a UTF-16 PowerShell dump)
+    are skipped. Cached 10 min. None => no Spotify account linked."""
+    loop = asyncio.get_event_loop()
+    if _spotify_account_cache["at"] and loop.time() - _spotify_account_cache["at"] < _SPOTIFY_ACCOUNT_TTL_SECONDS:
+        return _spotify_account_cache["account"]
+    account = None
+    candidates = [os.path.join(settings.data_dir, "Sources.xml")]
+    try:
+        for entry in sorted(os.listdir(settings.data_dir)):
+            candidates.append(os.path.join(settings.data_dir, entry, "Sources.xml"))
+    except OSError:
+        pass
+    for path in candidates:
+        try:
+            root = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        for key in root.iter("sourceKey"):
+            if key.get("type") == "SPOTIFY" and key.get("account"):
+                account = key.get("account")
+                break
+        if account:
+            break
+    _spotify_account_cache["account"] = account
+    _spotify_account_cache["at"] = loop.time()
+    return account
+
+
+async def _spotify_web_token() -> str:
+    """Client-credentials access token, cached until 60s before expiry."""
+    if not _spotify_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Spotify Web API not configured -- set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET",
+        )
+    loop = asyncio.get_event_loop()
+    if _spotify_cc_token["token"] and loop.time() < _spotify_cc_token["expires_at"]:
+        return _spotify_cc_token["token"]
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                _SPOTIFY_TOKEN_URL,
+                data={"grant_type": "client_credentials"},
+                auth=(settings.spotify_client_id, settings.spotify_client_secret),
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify token request failed: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Spotify token request rejected: {r.text[:200]}")
+    data = r.json()
+    _spotify_cc_token["token"] = data["access_token"]
+    _spotify_cc_token["expires_at"] = loop.time() + data.get("expires_in", 3600) - 60
+    return _spotify_cc_token["token"]
+
+
+def _spotify_image(images: list) -> str:
+    """Mid-size image URL from a Spotify images array (sorted largest
+    first); the 300px variant when present, else whatever exists."""
+    if not images:
+        return ""
+    pick = images[1] if len(images) > 1 else images[0]
+    return pick.get("url", "")
+
+
+@app.get("/api/v1/spotify/status", tags=["soundcork-api"])
+async def api_spotify_status():
+    """Card bootstrap: is search usable, and can the speakers play natively?
+
+    configured      -- SPOTIFY_CLIENT_ID/SECRET env vars present (Web API
+                       search works).
+    speaker_account -- SPOTIFY sourceAccount found in Sources.xml, else
+                       null (= no Spotify account linked on the speakers;
+                       /play will refuse with 409 until one is linked).
+    """
+    return {"configured": _spotify_configured(), "speaker_account": _spotify_speaker_account()}
+
+
+@app.get("/api/v1/spotify/search", tags=["soundcork-api"])
+async def api_spotify_search(q: str, type: str = "show"):
+    """Catalog search for podcast shows by name. Returns
+    {shows: [{uri, name, publisher, image}]}."""
+    if type != "show":
+        raise HTTPException(status_code=400, detail="only type=show is supported")
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="q is required")
+    token = await _spotify_web_token()
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{_SPOTIFY_API}/search",
+                params={"q": q.strip(), "type": "show", "limit": 20, "market": _SPOTIFY_MARKET},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify search failed: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Spotify search error: {r.text[:200]}")
+    shows = []
+    for item in (r.json().get("shows") or {}).get("items") or []:
+        if not item:
+            continue
+        shows.append(
+            {
+                "uri": item.get("uri", ""),
+                "name": item.get("name", ""),
+                "publisher": item.get("publisher", ""),
+                "image": _spotify_image(item.get("images") or []),
+            }
+        )
+    return {"shows": shows}
+
+
+@app.get("/api/v1/spotify/episodes", tags=["soundcork-api"])
+async def api_spotify_episodes(id: str):
+    """50 newest episodes of a show (id = base62 show id or spotify:show:
+    URI). Returns {episodes: [{uri, title, date, duration_seconds, image}]}."""
+    show_id = id.split(":")[-1].strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{22}", show_id):
+        raise HTTPException(status_code=400, detail="id must be a 22-char Spotify show id or spotify:show: URI")
+    token = await _spotify_web_token()
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{_SPOTIFY_API}/shows/{show_id}/episodes",
+                params={"limit": 50, "market": _SPOTIFY_MARKET},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify episodes failed: {e}")
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Spotify show {show_id} not found")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Spotify episodes error: {r.text[:200]}")
+    episodes = []
+    for item in r.json().get("items") or []:
+        if not item:
+            continue  # API pads removed episodes with nulls
+        duration_ms = item.get("duration_ms")
+        episodes.append(
+            {
+                "uri": item.get("uri", ""),
+                "title": item.get("name", ""),
+                "date": item.get("release_date", ""),
+                "duration_seconds": round(duration_ms / 1000) if duration_ms else None,
+                "image": _spotify_image(item.get("images") or []),
+            }
+        )
+    return {"show_id": show_id, "episodes": episodes}
+
+
+@app.post("/api/v1/spotify/play", tags=["soundcork-api"])
+async def api_spotify_play(request: Request):
+    """Play a Spotify URI on speakers via the NATIVE SPOTIFY source.
+
+    Body: {uri, title?, image?, source_account?, master_ip,
+           master_device_id, slaves: [{ip, device_id}]}
+
+    Builds the ContentItem shape upstream's webui stores as working
+    presets (see section header for evidence):
+      source="SPOTIFY" type="tracklisturl"
+      location="/playback/container/{base64(uri)}"
+      sourceAccount={Spotify user id from Sources.xml}
+    then runs the shared select -> confirm PLAY_STATE -> zone pipeline.
+
+    409s when no Spotify account is linked on the speakers (the firmware
+    rejects /select for sources it has no credentials for); the optional
+    source_account body field overrides discovery for hardware testing.
+    """
+    body = await request.json()
+    uri = (body.get("uri") or "").strip()
+    master_ip = body.get("master_ip", "")
+    slaves = body.get("slaves", [])
+    if not master_ip or not uri:
+        raise HTTPException(status_code=400, detail="master_ip and uri are required")
+    if not re.fullmatch(_SPOTIFY_URI_RE, uri):
+        raise HTTPException(
+            status_code=400,
+            detail="uri must look like spotify:show:... / spotify:episode:... (track, album, playlist, artist also accepted)",
+        )
+    account = (body.get("source_account") or "").strip() or _spotify_speaker_account()
+    if not account:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No Spotify account is linked on the speakers (no SPOTIFY source in "
+                "Sources.xml). Link a Spotify Premium account via the SoundCork webui "
+                "(requires SPOTIFY_CLIENT_ID/SECRET) before native playback can work."
+            ),
+        )
+
+    title = (body.get("title") or "").strip() or uri
+    image = (body.get("image") or "").strip()
+    location = "/playback/container/" + _base64.b64encode(uri.encode()).decode()
+    xml = (
+        f'<ContentItem source="SPOTIFY" type="tracklisturl" '
+        f"location={_xml_quoteattr(location)} "
+        f"sourceAccount={_xml_quoteattr(account)} "
+        f'isPresetable="true">'
+        f"<itemName>{_xml_escape(title)}</itemName>"
+        f"<containerArt>{_xml_escape(image)}</containerArt>"
+        f"</ContentItem>"
+    )
+
+    confirmed = await _select_confirm_zone(xml, master_ip, body.get("master_device_id", ""), slaves)
+
+    return {
+        "success": True,
+        "title": title,
+        "speakers": len(slaves) + 1,
+        "play_confirmed": confirmed,
+        "uri": uri,
+    }
 
 
 # ---------------------------------------------------------------------------

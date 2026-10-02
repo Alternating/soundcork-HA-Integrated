@@ -46,6 +46,15 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._ihShow = null;
     this._ihEpisodes = [];
     this._ihEpisodesLoading = false;
+    this._spStatus = null;
+    this._spFavorites = [];
+    this._spQuery = '';
+    this._spSearching = false;
+    this._spShows = [];
+    this._spView = 'list';
+    this._spShow = null;
+    this._spEpisodes = [];
+    this._spLoading = false;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -65,6 +74,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       else if (this._mode === "podcast") { this._loadPodcastFavorites(); this._loadTuneinPopular(); }
       else if (this._mode === "pushkin") { this._loadPushkin(); }
       else if (this._mode === "iheart") { this._loadIheart(); }
+      else if (this._mode === "spotify") { this._loadSpotify(); }
       else if (this._mode !== "speaker") { this._loadPresets(); }
     }
     if (this._mode === "speaker" || this._mode === "pandora") this._render();
@@ -1060,6 +1070,98 @@ class SoundcorkPresetEditor extends HTMLElement {
     }
   }
 
+  async _loadSpotify() {
+    try {
+      const [sr, fr] = await Promise.all([
+        fetch(`${this._baseUrl}/api/v1/spotify/status`, {signal: AbortSignal.timeout(10000)}),
+        fetch(`${this._baseUrl}/api/v1/podcasts/favorites?provider=spotify`, {signal: AbortSignal.timeout(5000)}),
+      ]);
+      this._spStatus = await sr.json();
+      this._spFavorites = (await fr.json()).favorites || [];
+    } catch(e) { console.warn('SoundCork: loadSpotify failed', e); }
+    this._render();
+  }
+
+  _spIsFavorite(uri) { return this._spFavorites.some(f => f.guide_id === uri); }
+
+  async _spToggleFavorite(show) {
+    const uri = show.uri || show.guide_id;
+    try {
+      let r;
+      if (this._spIsFavorite(uri)) {
+        r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites/${encodeURIComponent(uri)}?provider=spotify`, {method:'DELETE'});
+      } else {
+        r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider:'spotify', guide_id: uri, name: show.name, image: show.image || '' })
+        });
+      }
+      this._spFavorites = (await r.json()).favorites || [];
+    } catch(e) { console.warn('SoundCork: spotify favorite failed', e); }
+    this._render();
+  }
+
+  async _spSearch(query) {
+    if (!query.trim()) return;
+    this._spQuery = query;
+    this._spSearching = true; this._spShows = []; this._render();
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/search?q=${encodeURIComponent(query)}&type=show`, {signal: AbortSignal.timeout(15000)});
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || 'Spotify search failed');
+      this._spShows = data.shows || [];
+    } catch(e) {
+      console.warn('SoundCork: spotify search failed', e);
+      this._podcastStatus = {type:'error', msg: e.message || 'Spotify search failed'};
+      setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+    }
+    this._spSearching = false; this._render();
+  }
+
+  async _spOpenEpisodes(show) {
+    this._spShow = { uri: show.uri || show.guide_id, name: show.name, image: show.image || '' };
+    this._spView = 'episodes';
+    this._spEpisodes = [];
+    this._spLoading = true;
+    this._render();
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/spotify/episodes?id=${encodeURIComponent(this._spShow.uri)}`, {signal: AbortSignal.timeout(15000)})).json();
+      this._spEpisodes = data.episodes || [];
+    } catch(e) { console.warn('SoundCork: spotify episodes failed', e); }
+    this._spLoading = false;
+    this._render();
+  }
+
+  async _spPlay(uri, title, image) {
+    const targets = this._getTargetSpeakers();
+    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
+    this._podcastLoading = true;
+    this._podcastStatus = {type:'loading', msg:`Starting: ${title}...`};
+    this._render();
+    const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
+    if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
+    const masterIdx = this._pickMasterIdx(reachable);
+    const master = reachable[masterIdx], slaves = reachable.filter((_, i) => i !== masterIdx);
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/play`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ uri, title, image: image || '', master_ip: master.ip, master_device_id: master.device_id, slaves })
+      });
+      const data = await r.json();
+      if (r.ok && data.success) {
+        const note = data.play_confirmed === false ? ' (speaker has not confirmed playback yet)' : '';
+        this._podcastStatus = {type:'success', msg:`Playing: ${data.title} on ${data.speakers} speaker${data.speakers>1?'s':''}${note}`};
+      } else {
+        this._podcastStatus = {type:'error', msg: data.detail || 'Playback failed'};
+      }
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg:'Network error - check SoundCork connection'};
+    }
+    this._podcastLoading = false;
+    this._render();
+    setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+  }
+
   _render() {
     if (this._mode === "podcast") {
       const speakerNames = this._getSpeakerNames();
@@ -1410,6 +1512,122 @@ class SoundcorkPresetEditor extends HTMLElement {
         this.shadowRoot.querySelectorAll('.ih-show-fav').forEach(b => b.addEventListener('click', () => { const s = this._ihShows[parseInt(b.dataset.i)]; if (s) this._ihToggleFavorite(s); }));
         this.shadowRoot.querySelectorAll('.ih-show-play').forEach(b => b.addEventListener('click', () => { const s = this._ihShows[parseInt(b.dataset.i)]; if (s) this._ihPlayLatest(s); }));
         this.shadowRoot.querySelectorAll('.ih-show-eps').forEach(b => b.addEventListener('click', () => { const s = this._ihShows[parseInt(b.dataset.i)]; if (s) this._ihOpenEpisodes(s); }));
+      }
+      return;
+    }
+    if (this._mode === "spotify") {
+      const speakerNames = this._getSpeakerNames();
+      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
+      const chipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected?'active':'') + '" data-spk="all">All</span>' +
+        speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
+      const statusHtml = this._podcastStatus ? `<div class="podcast-status ${this._podcastStatus.type}">${this._podcastStatus.msg}</div>` : '';
+      const st = this._spStatus;
+
+      let bodyHtml;
+      if (this._spView === 'episodes' && this._spShow) {
+        const fav = this._spIsFavorite(this._spShow.uri);
+        const eps = this._spLoading
+          ? '<div class="loading">Loading episodes...</div>'
+          : this._spEpisodes.length ? this._spEpisodes.map((ep, i) => `
+            <div class="result">
+              <div class="result-art">${ep.image?`<img src="${this._esc(ep.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
+              <div class="result-info">
+                <div class="result-name">${this._esc(ep.title)}</div>
+                <div class="result-sub">${this._esc(ep.date)}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
+              </div>
+              <button class="play-btn sp-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
+            </div>`).join('') : '<div class="empty">No episodes found</div>';
+        bodyHtml = `
+          <div class="ep-header">
+            <button class="back-btn" id="sp-back" title="Back to shows">&#x2190;</button>
+            <div class="result-art">${this._spShow.image?`<img src="${this._esc(this._spShow.image)}" alt=""/>`:'&#x1F399;'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(this._spShow.name)}</div><div class="result-sub">Newest episodes</div></div>
+            <button class="fav-btn ${fav?'active':''}" id="sp-fav" title="${fav?'Remove favorite':'Save favorite'}">${fav?'&#x2665;':'&#x2661;'}</button>
+          </div>
+          <div class="results">${eps}</div>`;
+      } else {
+        const favRows = this._spFavorites.map((f, i) => `
+          <div class="result">
+            <div class="result-art">${f.image?`<img src="${this._esc(f.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(f.name)}</div><div class="result-sub">show</div></div>
+            <div class="pandora-btns"><button class="play-btn sp-fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play show">&#x25B6; Play</button><button class="play-btn sp-fav-eps" data-i="${i}">Episodes</button></div>
+            <button class="fav-del sp-fav-del" data-i="${i}" title="Remove favorite">&#x2715;</button>
+          </div>`).join('');
+        // Playback goes through the speaker's NATIVE Spotify client (DRM) -
+        // it only works once a Spotify account is linked on the speakers.
+        const accountWarn = st && !st.speaker_account
+          ? '<div class="warn-banner">No Spotify account is linked on the speakers yet (Sources.xml has no SPOTIFY source), so playback will fail. Link a Spotify Premium account via the SoundCork webui first - search and favorites work regardless.</div>'
+          : '';
+        const favsHtml = `
+          <div class="pandora-acct-header">Spotify Favorites</div>
+          ${this._spFavorites.length ? `<div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : '<div class="empty" style="padding:6px 0 12px">No favorites yet - &#x2661; a search result below</div>'}`;
+        let searchHtml;
+        if (st && !st.configured) {
+          searchHtml = `
+          <div class="pandora-acct-header">Search Spotify</div>
+          <div class="warn-banner">Spotify search is not set up on SoundCork yet. Create a free app at developer.spotify.com/dashboard, then set the <b>SPOTIFY_CLIENT_ID</b> and <b>SPOTIFY_CLIENT_SECRET</b> environment variables on the soundcork container and restart it. Existing favorites above keep working.</div>`;
+        } else {
+          searchHtml = `
+          <div class="pandora-acct-header">Search Spotify</div>
+          <div class="search-row">
+            <input class="search-input" id="sp-search" type="text" placeholder="Search podcast shows (e.g. Heavyweight)" value="${this._esc(this._spQuery)}"/>
+            <button class="search-btn" id="sp-search-btn" ${this._spSearching?'disabled':''}>${this._spSearching?'...':'Search'}</button>
+          </div>`;
+        }
+        let resultsHtml = '';
+        if (this._spSearching) resultsHtml = '<div class="loading">Searching Spotify...</div>';
+        else if (this._spShows.length) resultsHtml = this._spShows.map((s, i) => `
+              <div class="result">
+                <div class="result-art">${s.image?`<img src="${this._esc(s.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
+                <div class="result-info"><div class="result-name">${this._esc(s.name)}</div>${s.publisher?`<div class="result-sub">${this._esc(s.publisher)}</div>`:''}</div>
+                <button class="fav-btn ${this._spIsFavorite(s.uri)?'active':''} sp-show-fav" data-i="${i}" title="Favorite">${this._spIsFavorite(s.uri)?'&#x2665;':'&#x2661;'}</button>
+                <div class="pandora-btns"><button class="play-btn sp-show-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play show">&#x25B6;</button><button class="play-btn sp-show-eps" data-i="${i}">Episodes</button></div>
+              </div>`).join('');
+        else if (this._spQuery && !this._spSearching) resultsHtml = '<div class="empty">No results</div>';
+        bodyHtml = `${accountWarn}${favsHtml}${searchHtml}<div class="results">${resultsHtml}</div>`;
+      }
+
+      this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
+        <h3>Spotify-Podcasts</h3>
+        ${chipsHtml}
+        ${statusHtml}
+        ${bodyHtml}
+      </div></ha-card>`;
+
+      this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          const spk = chip.dataset.spk;
+          if (spk === 'all') { this._selectedSpeakers = null; }
+          else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (!this._selectedSpeakers.length) this._selectedSpeakers = null; }
+            else { this._selectedSpeakers.push(spk); }
+          }
+          this._render();
+        });
+      });
+      if (this._spView === 'episodes' && this._spShow) {
+        this.shadowRoot.getElementById('sp-back')?.addEventListener('click', () => { this._spView = 'list'; this._spShow = null; this._render(); });
+        this.shadowRoot.getElementById('sp-fav')?.addEventListener('click', () => this._spToggleFavorite(this._spShow));
+        this.shadowRoot.querySelectorAll('.sp-ep-play').forEach(b => b.addEventListener('click', () => {
+          const ep = this._spEpisodes[parseInt(b.dataset.i)];
+          if (ep) this._spPlay(ep.uri, `${this._spShow.name}: ${ep.title}`, ep.image || this._spShow.image);
+        }));
+      } else {
+        const si = this.shadowRoot.getElementById('sp-search');
+        // Search fires on Enter/button ONLY (commit 1b1c611 lesson: a
+        // per-keystroke _render() drops input focus and bare letters become
+        // HA quick-bar hotkeys), and key events must not leak to HA.
+        si?.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') this._spSearch(si.value); });
+        si?.addEventListener('keyup', e => e.stopPropagation());
+        this.shadowRoot.getElementById('sp-search-btn')?.addEventListener('click', () => { if (si) this._spSearch(si.value); });
+        this.shadowRoot.querySelectorAll('.sp-fav-play').forEach(b => b.addEventListener('click', () => { const f = this._spFavorites[parseInt(b.dataset.i)]; if (f) this._spPlay(f.guide_id, f.name, f.image); }));
+        this.shadowRoot.querySelectorAll('.sp-fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._spFavorites[parseInt(b.dataset.i)]; if (f) this._spOpenEpisodes(f); }));
+        this.shadowRoot.querySelectorAll('.sp-fav-del').forEach(b => b.addEventListener('click', () => { const f = this._spFavorites[parseInt(b.dataset.i)]; if (f) this._spToggleFavorite(f); }));
+        this.shadowRoot.querySelectorAll('.sp-show-fav').forEach(b => b.addEventListener('click', () => { const s = this._spShows[parseInt(b.dataset.i)]; if (s) this._spToggleFavorite(s); }));
+        this.shadowRoot.querySelectorAll('.sp-show-play').forEach(b => b.addEventListener('click', () => { const s = this._spShows[parseInt(b.dataset.i)]; if (s) this._spPlay(s.uri, s.name, s.image); }));
+        this.shadowRoot.querySelectorAll('.sp-show-eps').forEach(b => b.addEventListener('click', () => { const s = this._spShows[parseInt(b.dataset.i)]; if (s) this._spOpenEpisodes(s); }));
       }
       return;
     }
