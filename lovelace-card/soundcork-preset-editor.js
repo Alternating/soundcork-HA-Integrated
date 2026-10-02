@@ -930,6 +930,35 @@ class SoundcorkPresetEditor extends HTMLElement {
     setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
   }
 
+  _pkShowRowsHtml() {
+    const filter = this._pkFilter.trim().toLowerCase();
+    const shows = filter ? this._pkShows.filter(s => s.name.toLowerCase().includes(filter)) : this._pkShows;
+    return shows.length ? shows.map((s) => {
+      const i = this._pkShows.indexOf(s);
+      return `
+      <div class="result">
+        <div class="result-art"><div style="font-size:20px">&#x1F399;</div></div>
+        <div class="result-info"><div class="result-name">${this._esc(s.name)}</div></div>
+        <button class="fav-btn ${this._pkIsFavorite(s.slug)?'active':''} pk-show-fav" data-i="${i}" title="Favorite">${this._pkIsFavorite(s.slug)?'&#x2665;':'&#x2661;'}</button>
+        <div class="pandora-btns"><button class="play-btn pk-show-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6;</button><button class="play-btn pk-show-eps" data-i="${i}">Episodes</button></div>
+      </div>`;}).join('') : (this._pkShows.length ? '<div class="empty">No shows match</div>' : '<div class="loading">Loading Pushkin catalog...</div>');
+  }
+
+  _pkBindShowRows() {
+    const list = this.shadowRoot.getElementById('pk-show-list');
+    if (!list) return;
+    list.querySelectorAll('.pk-show-fav').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkToggleFavorite(s); }));
+    list.querySelectorAll('.pk-show-play').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkPlayLatest(s); }));
+    list.querySelectorAll('.pk-show-eps').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkOpenEpisodes(s); }));
+  }
+
+  _pkRefreshShowList() {
+    const list = this.shadowRoot.getElementById('pk-show-list');
+    if (!list) return;
+    list.innerHTML = this._pkShowRowsHtml();
+    this._pkBindShowRows();
+  }
+
   _render() {
     if (this._mode === "podcast") {
       const speakerNames = this._getSpeakerNames();
@@ -1109,24 +1138,13 @@ class SoundcorkPresetEditor extends HTMLElement {
             <div class="pandora-btns"><button class="play-btn pk-fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6; Play</button><button class="play-btn pk-fav-eps" data-i="${i}">Episodes</button></div>
             <button class="fav-del pk-fav-del" data-i="${i}" title="Remove favorite">&#x2715;</button>
           </div>`).join('');
-        const filter = this._pkFilter.trim().toLowerCase();
-        const shows = filter ? this._pkShows.filter(s => s.name.toLowerCase().includes(filter)) : this._pkShows;
-        const showRows = shows.length ? shows.map((s) => {
-          const i = this._pkShows.indexOf(s);
-          return `
-          <div class="result">
-            <div class="result-art"><div style="font-size:20px">&#x1F399;</div></div>
-            <div class="result-info"><div class="result-name">${this._esc(s.name)}</div></div>
-            <button class="fav-btn ${this._pkIsFavorite(s.slug)?'active':''} pk-show-fav" data-i="${i}" title="Favorite">${this._pkIsFavorite(s.slug)?'&#x2665;':'&#x2661;'}</button>
-            <div class="pandora-btns"><button class="play-btn pk-show-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6;</button><button class="play-btn pk-show-eps" data-i="${i}">Episodes</button></div>
-          </div>`;}).join('') : (this._pkShows.length ? '<div class="empty">No shows match</div>' : '<div class="loading">Loading Pushkin catalog...</div>');
         bodyHtml = `
           ${this._pkFavorites.length ? `<div class="pandora-acct-header">Pushkin Favorites</div><div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : ''}
           <div class="pandora-acct-header">All Shows</div>
           <div class="search-row">
             <input class="search-input" id="pk-filter" type="text" placeholder="Filter shows (e.g. Revisionist)" value="${this._esc(this._pkFilter)}"/>
           </div>
-          <div class="results">${showRows}</div>`;
+          <div class="results" id="pk-show-list">${this._pkShowRowsHtml()}</div>`;
       }
 
       this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
@@ -1158,15 +1176,14 @@ class SoundcorkPresetEditor extends HTMLElement {
         }));
       } else {
         const pf = this.shadowRoot.getElementById('pk-filter');
-        pf?.addEventListener('input', () => {
-          this._pkFilter = pf.value;
-          this._render();
-          const el = this.shadowRoot.getElementById('pk-filter');
-          if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
-        });
-        this.shadowRoot.querySelectorAll('.pk-show-fav').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkToggleFavorite(s); }));
-        this.shadowRoot.querySelectorAll('.pk-show-play').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkPlayLatest(s); }));
-        this.shadowRoot.querySelectorAll('.pk-show-eps').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkOpenEpisodes(s); }));
+        // Keystrokes must never leak to HA's global hotkey handler (quick-bar
+        // opens on bare letters), and the input must never be re-rendered
+        // mid-typing or focus drops to <body> and letters become hotkeys.
+        // So: swallow key events and patch only the list below, in place.
+        pf?.addEventListener('keydown', e => e.stopPropagation());
+        pf?.addEventListener('keyup', e => e.stopPropagation());
+        pf?.addEventListener('input', () => { this._pkFilter = pf.value; this._pkRefreshShowList(); });
+        this._pkBindShowRows();
         this.shadowRoot.querySelectorAll('.pk-fav-play').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkPlayLatest(f); }));
         this.shadowRoot.querySelectorAll('.pk-fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkOpenEpisodes(f); }));
         this.shadowRoot.querySelectorAll('.pk-fav-del').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkToggleFavorite(f); }));
