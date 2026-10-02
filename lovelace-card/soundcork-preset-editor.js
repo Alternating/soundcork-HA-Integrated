@@ -865,7 +865,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         const favRows = this._podcastFavorites.map((f, i) => {
           const kind = f.guide_id.startsWith('p') ? 'show' : f.guide_id.startsWith('t') ? 'episode' : 'station';
           const actionBtn = kind === 'show'
-            ? `<button class="play-btn fav-eps" data-i="${i}">Episodes</button>`
+            ? `<div class="pandora-btns"><button class="play-btn fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6; Play</button><button class="play-btn fav-eps" data-i="${i}">Episodes</button></div>`
             : `<button class="play-btn fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>`;
           return `<div class="result">
             <div class="result-art">${f.image?`<img src="${this._esc(f.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
@@ -892,7 +892,7 @@ class SoundcorkPresetEditor extends HTMLElement {
                 <div class="result-art">${s.image?`<img src="${this._esc(s.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
                 <div class="result-info"><div class="result-name">${this._esc(s.name)}</div>${s.subtext?`<div class="result-sub">${this._esc(s.subtext)}</div>`:''}</div>
                 <button class="fav-btn ${this._isFavorite(s.guide_id)?'active':''} show-fav" data-i="${i}" title="Favorite">${this._isFavorite(s.guide_id)?'&#x2665;':'&#x2661;'}</button>
-                <button class="play-btn show-eps" data-i="${i}">Episodes</button>
+                <div class="pandora-btns"><button class="play-btn show-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6;</button><button class="play-btn show-eps" data-i="${i}">Episodes</button></div>
               </div>`).join('');
           }
           if (this._podcastStations.length) {
@@ -959,6 +959,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         const sb = this.shadowRoot.getElementById('pod-search-btn');
         sb?.addEventListener('click', () => this._podcastSearch(si.value));
         si?.addEventListener('keydown', e => { if (e.key === 'Enter') this._podcastSearch(si.value); });
+        this.shadowRoot.querySelectorAll('.show-play').forEach(b => b.addEventListener('click', () => { const s = this._podcastShows[parseInt(b.dataset.i)]; if (s) this._playGuideId(s.guide_id, s.name, s.image); }));
         this.shadowRoot.querySelectorAll('.show-eps').forEach(b => b.addEventListener('click', () => { const s = this._podcastShows[parseInt(b.dataset.i)]; if (s) this._openEpisodes(s); }));
         this.shadowRoot.querySelectorAll('.show-fav').forEach(b => b.addEventListener('click', () => { const s = this._podcastShows[parseInt(b.dataset.i)]; if (s) this._toggleFavorite(s); }));
         this.shadowRoot.querySelectorAll('.st-fav').forEach(b => b.addEventListener('click', () => { const s = this._podcastStations[parseInt(b.dataset.i)]; if (s) this._toggleFavorite(s); }));

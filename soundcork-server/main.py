@@ -2588,7 +2588,8 @@ async def api_card_js():
 @app.post("/api/v1/tunein/play-podcast", tags=["soundcork-api"])
 async def api_play_podcast(request: Request):
     """
-    Play a TuneIn podcast episode (t...) or live station (s...) on speakers.
+    Play a TuneIn podcast episode (t...), live station (s...) or show (p...,
+    plays its latest episode) on speakers.
 
     Body JSON:
     {
@@ -2612,11 +2613,30 @@ async def api_play_podcast(request: Request):
 
     if not master_ip or not (guide_id or url):
         raise HTTPException(status_code=400, detail="master_ip and guide_id (or url) are required")
-    if guide_id and not re.fullmatch(r"[ts]\d+", guide_id):
-        raise HTTPException(status_code=400, detail="guide_id must be an episode (t...) or station (s...) id")
+    if guide_id and not re.fullmatch(r"[pts]\d+", guide_id):
+        raise HTTPException(status_code=400, detail="guide_id must be an episode (t...), station (s...) or show (p...) id")
 
     if not guide_id:
         guide_id = await _extract_tunein_guide_id(url)
+
+    if guide_id.startswith("p"):
+        # Show id: play its most recent episode
+        try:
+            async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                r = await client.get(f"https://opml.radiotime.com/Tune.ashx?c=pbrowse&id={guide_id}&render=json")
+                data = r.json()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"TuneIn episode list failed: {e}")
+        latest = next(
+            (c for s in data.get("body", []) for c in s.get("children", [])
+             if c.get("item") == "topic" and c.get("guide_id")),
+            None,
+        )
+        if latest is None:
+            raise HTTPException(status_code=404, detail=f"No episodes found for show {guide_id}")
+        guide_id = latest["guide_id"]
+        if not (body.get("image") or "").strip():
+            body["image"] = latest.get("image", "")
 
     stream_url, resolved_title = await _resolve_tunein_stream(guide_id)
     title = (body.get("title") or "").strip() or resolved_title
