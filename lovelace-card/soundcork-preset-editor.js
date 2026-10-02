@@ -30,6 +30,13 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._podcastEpisodes = [];
     this._podcastEpisodesLoading = false;
     this._podcastFavorites = [];
+    this._pkShows = [];
+    this._pkFilter = '';
+    this._pkView = 'list';
+    this._pkShow = null;
+    this._pkEpisodes = [];
+    this._pkLoading = false;
+    this._pkFavorites = [];
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -47,6 +54,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       this._initialized = true;
       if (this._mode === "pandora") { this._loadPandora(); this._loadPresets(); }
       else if (this._mode === "podcast") { this._loadPodcastFavorites(); }
+      else if (this._mode === "pushkin") { this._loadPushkin(); }
       else if (this._mode !== "speaker") { this._loadPresets(); }
     }
     if (this._mode === "speaker" || this._mode === "pandora") this._render();
@@ -830,6 +838,98 @@ class SoundcorkPresetEditor extends HTMLElement {
     setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
   }
 
+  async _loadPushkin() {
+    try {
+      const [sr, fr] = await Promise.all([
+        fetch(`${this._baseUrl}/api/v1/pushkin/shows`, {signal: AbortSignal.timeout(15000)}),
+        fetch(`${this._baseUrl}/api/v1/podcasts/favorites?provider=pushkin`, {signal: AbortSignal.timeout(5000)}),
+      ]);
+      this._pkShows = (await sr.json()).shows || [];
+      this._pkFavorites = (await fr.json()).favorites || [];
+    } catch(e) { console.warn('SoundCork: loadPushkin failed', e); }
+    this._render();
+  }
+
+  _pkIsFavorite(slug) { return this._pkFavorites.some(f => f.guide_id === slug); }
+
+  async _pkToggleFavorite(show) {
+    const slug = show.slug || show.guide_id;
+    try {
+      let r;
+      if (this._pkIsFavorite(slug)) {
+        r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites/${slug}?provider=pushkin`, {method:'DELETE'});
+      } else {
+        r = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider:'pushkin', guide_id: slug, name: show.name, image: show.image || '' })
+        });
+      }
+      this._pkFavorites = (await r.json()).favorites || [];
+    } catch(e) { console.warn('SoundCork: pushkin favorite failed', e); }
+    this._render();
+  }
+
+  async _pkOpenEpisodes(show) {
+    this._pkShow = { slug: show.slug || show.guide_id, name: show.name, image: show.image || '' };
+    this._pkView = 'episodes';
+    this._pkEpisodes = [];
+    this._pkLoading = true;
+    this._render();
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/pushkin/episodes?show=${encodeURIComponent(this._pkShow.slug)}`, {signal: AbortSignal.timeout(25000)})).json();
+      this._pkEpisodes = data.episodes || [];
+      if (data.show) this._pkShow = { slug: this._pkShow.slug, name: data.show.name || this._pkShow.name, image: data.show.image || this._pkShow.image };
+    } catch(e) { console.warn('SoundCork: pushkin episodes failed', e); }
+    this._pkLoading = false;
+    this._render();
+  }
+
+  async _pkPlayLatest(show) {
+    const slug = show.slug || show.guide_id;
+    this._podcastStatus = {type:'loading', msg:`Finding latest episode of ${show.name}...`};
+    this._render();
+    try {
+      const data = await (await fetch(`${this._baseUrl}/api/v1/pushkin/episodes?show=${encodeURIComponent(slug)}`, {signal: AbortSignal.timeout(25000)})).json();
+      const ep = (data.episodes || [])[0];
+      if (!ep) throw new Error('No episodes found');
+      await this._playStreamUrl(ep.audio_url, `${(data.show && data.show.name) || show.name}: ${ep.title}`, ep.image || (data.show && data.show.image) || '');
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg: e.message || 'Could not find episodes'};
+      this._render();
+      setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+    }
+  }
+
+  async _playStreamUrl(streamUrl, title, image) {
+    const targets = this._getTargetSpeakers();
+    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
+    this._podcastLoading = true;
+    this._podcastStatus = {type:'loading', msg:`Starting: ${title}...`};
+    this._render();
+    const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
+    if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
+    const masterIdx = this._pickMasterIdx(reachable);
+    const master = reachable[masterIdx], slaves = reachable.filter((_, i) => i !== masterIdx);
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/play-stream`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ stream_url: streamUrl, title, image: image || '', master_ip: master.ip, master_device_id: master.device_id, slaves })
+      });
+      const data = await r.json();
+      if (r.ok && data.success) {
+        const note = data.play_confirmed === false ? ' (speaker has not confirmed playback yet)' : '';
+        this._podcastStatus = {type:'success', msg:`Playing: ${data.title} on ${data.speakers} speaker${data.speakers>1?'s':''}${note}`};
+      } else {
+        this._podcastStatus = {type:'error', msg: data.detail || 'Playback failed'};
+      }
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg:'Network error - check SoundCork connection'};
+    }
+    this._podcastLoading = false;
+    this._render();
+    setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+  }
+
   _render() {
     if (this._mode === "podcast") {
       const speakerNames = this._getSpeakerNames();
@@ -922,7 +1022,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       }
 
       this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
-        <h3>Podcasts</h3>
+        <h3>TuneIn-Podcasts</h3>
         ${chipsHtml}
         ${statusHtml}
         ${bodyHtml}
@@ -969,6 +1069,107 @@ class SoundcorkPresetEditor extends HTMLElement {
         const doPlay = () => { const u = urlInput.value.trim(); if (u) this._playPodcast(u); };
         playBtn?.addEventListener('click', doPlay);
         urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') doPlay(); });
+      }
+      return;
+    }
+    if (this._mode === "pushkin") {
+      const speakerNames = this._getSpeakerNames();
+      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
+      const chipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected?'active':'') + '" data-spk="all">All</span>' +
+        speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
+      const statusHtml = this._podcastStatus ? `<div class="podcast-status ${this._podcastStatus.type}">${this._podcastStatus.msg}</div>` : '';
+
+      let bodyHtml;
+      if (this._pkView === 'episodes' && this._pkShow) {
+        const fav = this._pkIsFavorite(this._pkShow.slug);
+        const eps = this._pkLoading
+          ? '<div class="loading">Loading episodes...</div>'
+          : this._pkEpisodes.length ? this._pkEpisodes.map((ep, i) => `
+            <div class="result">
+              <div class="result-art">${ep.image?`<img src="${this._esc(ep.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
+              <div class="result-info">
+                <div class="result-name">${this._esc(ep.title)}</div>
+                <div class="result-sub">${this._esc((ep.date||'').replace(/\s*\d\d:\d\d:\d\d.*$/,''))}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
+              </div>
+              <button class="play-btn pk-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
+            </div>`).join('') : '<div class="empty">No episodes found</div>';
+        bodyHtml = `
+          <div class="ep-header">
+            <button class="back-btn" id="pk-back" title="Back to shows">&#x2190;</button>
+            <div class="result-art">${this._pkShow.image?`<img src="${this._esc(this._pkShow.image)}" alt=""/>`:'&#x1F399;'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(this._pkShow.name)}</div><div class="result-sub">Recent episodes</div></div>
+            <button class="fav-btn ${fav?'active':''}" id="pk-fav" title="${fav?'Remove favorite':'Save favorite'}">${fav?'&#x2665;':'&#x2661;'}</button>
+          </div>
+          <div class="results">${eps}</div>`;
+      } else {
+        const favRows = this._pkFavorites.map((f, i) => `
+          <div class="result">
+            <div class="result-art">${f.image?`<img src="${this._esc(f.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F399;</div>'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(f.name)}</div><div class="result-sub">show</div></div>
+            <div class="pandora-btns"><button class="play-btn pk-fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6; Play</button><button class="play-btn pk-fav-eps" data-i="${i}">Episodes</button></div>
+            <button class="fav-del pk-fav-del" data-i="${i}" title="Remove favorite">&#x2715;</button>
+          </div>`).join('');
+        const filter = this._pkFilter.trim().toLowerCase();
+        const shows = filter ? this._pkShows.filter(s => s.name.toLowerCase().includes(filter)) : this._pkShows;
+        const showRows = shows.length ? shows.map((s) => {
+          const i = this._pkShows.indexOf(s);
+          return `
+          <div class="result">
+            <div class="result-art"><div style="font-size:20px">&#x1F399;</div></div>
+            <div class="result-info"><div class="result-name">${this._esc(s.name)}</div></div>
+            <button class="fav-btn ${this._pkIsFavorite(s.slug)?'active':''} pk-show-fav" data-i="${i}" title="Favorite">${this._pkIsFavorite(s.slug)?'&#x2665;':'&#x2661;'}</button>
+            <div class="pandora-btns"><button class="play-btn pk-show-play" data-i="${i}" ${this._podcastLoading?'disabled':''} title="Play latest episode">&#x25B6;</button><button class="play-btn pk-show-eps" data-i="${i}">Episodes</button></div>
+          </div>`;}).join('') : (this._pkShows.length ? '<div class="empty">No shows match</div>' : '<div class="loading">Loading Pushkin catalog...</div>');
+        bodyHtml = `
+          ${this._pkFavorites.length ? `<div class="pandora-acct-header">Pushkin Favorites</div><div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : ''}
+          <div class="pandora-acct-header">All Shows</div>
+          <div class="search-row">
+            <input class="search-input" id="pk-filter" type="text" placeholder="Filter shows (e.g. Revisionist)" value="${this._esc(this._pkFilter)}"/>
+          </div>
+          <div class="results">${showRows}</div>`;
+      }
+
+      this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
+        <h3>Pushkin-Podcasts</h3>
+        ${chipsHtml}
+        ${statusHtml}
+        ${bodyHtml}
+      </div></ha-card>`;
+
+      this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          const spk = chip.dataset.spk;
+          if (spk === 'all') { this._selectedSpeakers = null; }
+          else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (!this._selectedSpeakers.length) this._selectedSpeakers = null; }
+            else { this._selectedSpeakers.push(spk); }
+          }
+          this._render();
+        });
+      });
+      if (this._pkView === 'episodes' && this._pkShow) {
+        this.shadowRoot.getElementById('pk-back')?.addEventListener('click', () => { this._pkView = 'list'; this._pkShow = null; this._render(); });
+        this.shadowRoot.getElementById('pk-fav')?.addEventListener('click', () => this._pkToggleFavorite(this._pkShow));
+        this.shadowRoot.querySelectorAll('.pk-ep-play').forEach(b => b.addEventListener('click', () => {
+          const ep = this._pkEpisodes[parseInt(b.dataset.i)];
+          if (ep) this._playStreamUrl(ep.audio_url, `${this._pkShow.name}: ${ep.title}`, ep.image || this._pkShow.image);
+        }));
+      } else {
+        const pf = this.shadowRoot.getElementById('pk-filter');
+        pf?.addEventListener('input', () => {
+          this._pkFilter = pf.value;
+          this._render();
+          const el = this.shadowRoot.getElementById('pk-filter');
+          if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+        });
+        this.shadowRoot.querySelectorAll('.pk-show-fav').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkToggleFavorite(s); }));
+        this.shadowRoot.querySelectorAll('.pk-show-play').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkPlayLatest(s); }));
+        this.shadowRoot.querySelectorAll('.pk-show-eps').forEach(b => b.addEventListener('click', () => { const s = this._pkShows[parseInt(b.dataset.i)]; if (s) this._pkOpenEpisodes(s); }));
+        this.shadowRoot.querySelectorAll('.pk-fav-play').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkPlayLatest(f); }));
+        this.shadowRoot.querySelectorAll('.pk-fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkOpenEpisodes(f); }));
+        this.shadowRoot.querySelectorAll('.pk-fav-del').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkToggleFavorite(f); }));
       }
       return;
     }

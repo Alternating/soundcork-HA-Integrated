@@ -2406,48 +2406,69 @@ async def api_zone_clear(ip: str):
 from urllib.parse import quote as _urlquote
 from xml.sax.saxutils import escape as _xml_escape, quoteattr as _xml_quoteattr
 
-_PODCAST_FAVORITES_PATH = os.path.join(settings.data_dir, "podcast_favorites.json")
+# Per-provider favorite stores. "tunein" keeps the original filename so
+# existing favorites survive; ids are TuneIn guide ids for tunein and
+# provider-native slugs/ids for the rest.
+_FAVORITE_PROVIDERS = {
+    "tunein": r"[pst]\d+",
+    "pushkin": r"[a-z0-9-]{1,80}",
+    "iheart": r"[A-Za-z0-9_-]{1,80}",
+}
 
 
-def _load_podcast_favorites() -> list:
+def _favorites_path(provider: str) -> str:
+    if provider == "tunein":
+        return os.path.join(settings.data_dir, "podcast_favorites.json")
+    return os.path.join(settings.data_dir, f"podcast_favorites_{provider}.json")
+
+
+def _check_favorites_provider(provider: str) -> str:
+    if provider not in _FAVORITE_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"provider must be one of {sorted(_FAVORITE_PROVIDERS)}")
+    return provider
+
+
+def _load_podcast_favorites(provider: str = "tunein") -> list:
     try:
-        with open(_PODCAST_FAVORITES_PATH, "r") as f:
+        with open(_favorites_path(provider), "r") as f:
             favs = _json.load(f)
             return favs if isinstance(favs, list) else []
     except Exception:
         return []
 
 
-def _save_podcast_favorites(favs: list) -> None:
-    with open(_PODCAST_FAVORITES_PATH, "w") as f:
+def _save_podcast_favorites(favs: list, provider: str = "tunein") -> None:
+    with open(_favorites_path(provider), "w") as f:
         _json.dump(favs, f, indent=2)
 
 
 @app.get("/api/v1/podcasts/favorites", tags=["soundcork-api"])
-async def api_podcast_favorites():
-    """List favorited podcast shows (p...) and stations (s...)."""
-    return {"favorites": _load_podcast_favorites()}
+async def api_podcast_favorites(provider: str = "tunein"):
+    """List favorites for a provider (tunein default, pushkin, iheart)."""
+    return {"favorites": _load_podcast_favorites(_check_favorites_provider(provider))}
 
 
 @app.post("/api/v1/podcasts/favorites", tags=["soundcork-api"])
 async def api_podcast_favorite_add(request: Request):
-    """Favorite a show or station. Body: {guide_id, name, image?}."""
+    """Favorite a show/station/episode. Body: {guide_id, name, image?, provider?}."""
     body = await request.json()
+    provider = _check_favorites_provider((body.get("provider") or "tunein").strip())
     guide_id = (body.get("guide_id") or "").strip()
     name = (body.get("name") or "").strip()
-    if not re.fullmatch(r"[pst]\d+", guide_id) or not name:
-        raise HTTPException(status_code=400, detail="guide_id (p.../s.../t...) and name are required")
-    favs = [f for f in _load_podcast_favorites() if f.get("guide_id") != guide_id]
+    if not re.fullmatch(_FAVORITE_PROVIDERS[provider], guide_id) or not name:
+        raise HTTPException(status_code=400, detail=f"valid {provider} guide_id and name are required")
+    favs = [f for f in _load_podcast_favorites(provider) if f.get("guide_id") != guide_id]
     favs.append({"guide_id": guide_id, "name": name, "image": (body.get("image") or "").strip()})
-    _save_podcast_favorites(favs)
+    _save_podcast_favorites(favs, provider)
     return {"favorites": favs}
 
 
 @app.delete("/api/v1/podcasts/favorites/{guide_id}", tags=["soundcork-api"])
-async def api_podcast_favorite_delete(guide_id: str):
-    """Remove a favorite by guide id."""
-    favs = [f for f in _load_podcast_favorites() if f.get("guide_id") != guide_id]
-    _save_podcast_favorites(favs)
+async def api_podcast_favorite_delete(guide_id: str, provider: str = "tunein"):
+    """Remove a favorite by id (provider query param, tunein default)."""
+    provider = _check_favorites_provider(provider)
+    favs = [f for f in _load_podcast_favorites(provider) if f.get("guide_id") != guide_id]
+    _save_podcast_favorites(favs, provider)
     return {"favorites": favs}
 
 
@@ -2644,6 +2665,35 @@ async def api_play_podcast(request: Request):
     title = (body.get("title") or "").strip() or resolved_title
     image = (body.get("image") or "").strip()
 
+    result = await _play_wrapped_stream(
+        stream_url, title, image, master_ip, body.get("master_device_id", ""), slaves
+    )
+    result["guide_id"] = guide_id
+    return result
+
+
+async def _play_wrapped_stream(
+    stream_url: str,
+    title: str,
+    image: str,
+    master_ip: str,
+    master_device_id: str,
+    slaves: list,
+    resolve_redirects: bool = False,
+) -> dict:
+    """Shared playback pipeline for any provider that yields a direct audio
+    URL (TuneIn, Pushkin, iHeart...): optional redirect pre-resolution, orion
+    wrap, select on master, confirm PLAY_STATE before zoning slaves."""
+    if resolve_redirects:
+        try:
+            async with _httpx.AsyncClient(
+                follow_redirects=True, timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}
+            ) as client:
+                async with client.stream("GET", stream_url) as resp:
+                    stream_url = str(resp.url)
+        except Exception:
+            pass  # fall back to the unresolved URL; the orion proxy may still cope
+
     location = _orion_station_location(title, image, stream_url)
     xml = (
         f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
@@ -2680,7 +2730,7 @@ async def api_play_podcast(request: Request):
     if slaves and confirmed:
         members = "".join(f'<member ipaddress="{s["ip"]}">{s["device_id"]}</member>' for s in slaves)
         zone_xml = (
-            f'<zone master="{body.get("master_device_id", "")}" '
+            f'<zone master="{master_device_id}" '
             f'senderIPAddress="{master_ip}">{members}</zone>'
         )
         try:
@@ -2707,11 +2757,156 @@ async def api_play_podcast(request: Request):
 
     return {
         "success": True,
-        "guide_id": guide_id,
         "title": title,
         "speakers": len(slaves) + 1,
         "play_confirmed": confirmed,
         "stream_url": stream_url,
+    }
+
+
+@app.post("/api/v1/play-stream", tags=["soundcork-api"])
+async def api_play_stream(request: Request):
+    """Play any direct audio URL on speakers via the shared orion pipeline.
+
+    Used by provider tiles (Pushkin, iHeart, ...) whose resolvers already
+    produced an MP3/stream URL. Redirect chains are pre-followed here.
+    Body: {stream_url, title?, image?, master_ip, master_device_id, slaves}
+    """
+    body = await request.json()
+    stream_url = (body.get("stream_url") or "").strip()
+    master_ip = body.get("master_ip", "")
+    if not stream_url.startswith(("http://", "https://")) or not master_ip:
+        raise HTTPException(status_code=400, detail="stream_url (http/https) and master_ip are required")
+    return await _play_wrapped_stream(
+        stream_url,
+        (body.get("title") or "").strip() or "Podcast",
+        (body.get("image") or "").strip(),
+        master_ip,
+        body.get("master_device_id", ""),
+        body.get("slaves", []),
+        resolve_redirects=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pushkin Industries (pushkin.fm)
+# Fixed curated catalog (~30 shows) scraped from pushkin.fm/podcasts; each
+# show page links its Omny RSS feed, whose enclosures are the same
+# podtrac/pscrb redirect-chain MP3s TuneIn episodes use -- playback goes
+# through the shared _play_wrapped_stream pipeline via /api/v1/play-stream.
+# ---------------------------------------------------------------------------
+
+_PUSHKIN_TTL_SECONDS = 6 * 3600.0
+_pushkin_cache = {"shows": None, "at": 0.0, "rss": {}}
+
+
+def _parse_itunes_duration(val) -> int | None:
+    val = str(val or "").strip()
+    if not val:
+        return None
+    try:
+        parts = [int(p) for p in val.split(":")]
+    except ValueError:
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs
+
+
+@app.get("/api/v1/pushkin/shows", tags=["soundcork-api"])
+async def api_pushkin_shows():
+    """Pushkin Industries show catalog, scraped from pushkin.fm (cached 6h)."""
+    loop = asyncio.get_event_loop()
+    if _pushkin_cache["shows"] and loop.time() - _pushkin_cache["at"] < _PUSHKIN_TTL_SECONDS:
+        return {"shows": _pushkin_cache["shows"]}
+    try:
+        async with _httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get("https://www.pushkin.fm/podcasts")
+            html = r.text
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"pushkin.fm catalog fetch failed: {e}")
+    shows = {}
+    for m in re.finditer(
+        r'<a[^>]*href="https://www\.pushkin\.fm/podcasts/([a-z0-9-]+)"[^>]*>(.*?)</a>', html, re.S
+    ):
+        slug = m.group(1)
+        name = re.sub(r"<[^>]+>", " ", m.group(2))
+        name = re.sub(r"\s+", " ", name).strip()
+        if name and slug not in shows:
+            shows[slug] = {"slug": slug, "name": name}
+    result = sorted(shows.values(), key=lambda s: s["name"].lower())
+    if result:
+        _pushkin_cache["shows"] = result
+        _pushkin_cache["at"] = loop.time()
+    return {"shows": result}
+
+
+@app.get("/api/v1/pushkin/episodes", tags=["soundcork-api"])
+async def api_pushkin_episodes(show: str):
+    """Recent episodes for a Pushkin show (slug from /api/v1/pushkin/shows).
+
+    Discovers the show's Omny RSS feed from its pushkin.fm page, then parses
+    the feed: enclosure MP3 URL, title, pubDate, itunes duration, artwork.
+    """
+    if not re.fullmatch(r"[a-z0-9-]{1,80}", show):
+        raise HTTPException(status_code=400, detail="show must be a pushkin.fm slug")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    rss_url = _pushkin_cache["rss"].get(show)
+    if not rss_url:
+        try:
+            async with _httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+                r = await client.get(f"https://www.pushkin.fm/podcasts/{show}")
+                page = r.text
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"pushkin.fm show page fetch failed: {e}")
+        m = re.search(r'https?://[^"\'\s]*omny\.fm/[^"\'\s]*podcast\.rss', page) or re.search(
+            r'[^"\'\s]*omny\.fm/shows/[^"\'\s]*podcast\.rss', page
+        )
+        if not m:
+            raise HTTPException(status_code=404, detail=f"No RSS feed found for show {show}")
+        rss_url = m.group(0)
+        if not rss_url.startswith("http"):
+            rss_url = "https://" + rss_url.lstrip("/")
+        _pushkin_cache["rss"][show] = rss_url
+    try:
+        async with _httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+            r = await client.get(rss_url)
+            root = ET.fromstring(r.content)
+    except Exception as e:
+        _pushkin_cache["rss"].pop(show, None)
+        raise HTTPException(status_code=502, detail=f"RSS fetch/parse failed: {e}")
+    itunes_ns = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+    channel = root.find("channel")
+    if channel is None:
+        raise HTTPException(status_code=502, detail="RSS feed had no channel element")
+    show_image_el = channel.find("itunes:image", itunes_ns)
+    show_image = show_image_el.get("href", "") if show_image_el is not None else ""
+    episodes = []
+    for item in channel.findall("item")[:50]:
+        enclosure = item.find("enclosure")
+        if enclosure is None or not enclosure.get("url"):
+            continue
+        item_image_el = item.find("itunes:image", itunes_ns)
+        episodes.append(
+            {
+                "title": item.findtext("title", default=""),
+                "date": item.findtext("pubDate", default=""),
+                "duration_seconds": _parse_itunes_duration(
+                    item.findtext("itunes:duration", default="", namespaces=itunes_ns)
+                ),
+                "audio_url": enclosure.get("url"),
+                "image": item_image_el.get("href", "") if item_image_el is not None else show_image,
+            }
+        )
+    return {
+        "show": {
+            "slug": show,
+            "name": channel.findtext("title", default=show),
+            "image": show_image,
+            "rss": rss_url,
+        },
+        "episodes": episodes,
     }
 
 
