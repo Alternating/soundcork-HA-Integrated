@@ -2435,8 +2435,8 @@ async def api_podcast_favorite_add(request: Request):
     body = await request.json()
     guide_id = (body.get("guide_id") or "").strip()
     name = (body.get("name") or "").strip()
-    if not re.fullmatch(r"[ps]\d+", guide_id) or not name:
-        raise HTTPException(status_code=400, detail="guide_id (p.../s...) and name are required")
+    if not re.fullmatch(r"[pst]\d+", guide_id) or not name:
+        raise HTTPException(status_code=400, detail="guide_id (p.../s.../t...) and name are required")
     favs = [f for f in _load_podcast_favorites() if f.get("guide_id") != guide_id]
     favs.append({"guide_id": guide_id, "name": name, "image": (body.get("image") or "").strip()})
     _save_podcast_favorites(favs)
@@ -2520,6 +2520,71 @@ async def _resolve_tunein_stream(guide_id: str) -> tuple:
     return final_url, title
 
 
+async def _extract_tunein_guide_id(url: str) -> str:
+    """Follow a tun.in / tunein.com link and pull the guide id out of the
+    final page URL (?topicid=NNN or a /p|s|tNNN path segment)."""
+    try:
+        async with _httpx.AsyncClient(
+            follow_redirects=True, timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}
+        ) as client:
+            r = await client.get(url)
+            final_page = str(r.url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not resolve URL: {e}")
+    m = re.search(r"topicid=(\d+)", final_page, re.IGNORECASE)
+    if m:
+        return f"t{m.group(1)}"
+    m = re.search(r"[/\-]([tps]\d+)(?:[/?]|$)", final_page, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    raise HTTPException(status_code=400, detail=f"Could not extract guide ID from: {final_page}")
+
+
+@app.post("/api/v1/tunein/resolve-url", tags=["soundcork-api"])
+async def api_tunein_resolve_url(request: Request):
+    """Resolve a tun.in / tunein.com URL to favorite-ready metadata.
+
+    Returns {guide_id, kind, name, image, show_id, show_title} where kind
+    is "show" (p...), "station" (s...) or "episode" (t...).
+    """
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    guide_id = await _extract_tunein_guide_id(url)
+    kind = {"p": "show", "s": "station", "t": "episode"}[guide_id[0]]
+    name, image, show_id, show_title = guide_id, "", None, None
+    try:
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(f"https://opml.radiotime.com/describe.ashx?id={guide_id}&render=json")
+            d = (r.json().get("body") or [{}])[0]
+        name = d.get("title") or d.get("name") or d.get("text") or guide_id
+        image = d.get("logo") or d.get("image") or ""
+        show_id = d.get("show_id")
+        show_title = d.get("show_title")
+    except Exception:
+        pass  # favorite still works with the bare guide id as its name
+    return {
+        "guide_id": guide_id,
+        "kind": kind,
+        "name": name,
+        "image": image,
+        "show_id": show_id,
+        "show_title": show_title,
+    }
+
+
+@app.get("/card/soundcork-preset-editor.js", include_in_schema=False)
+async def api_card_js():
+    """Serve the lovelace card straight from soundcork. Point the HA
+    dashboard resource at this URL and card updates ship with normal
+    server deploys instead of manual copies into HA's www/ folder."""
+    path = "/app/soundcork/card/soundcork-preset-editor.js"
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="card not bundled in this image")
+    return FileResponse(path, media_type="application/javascript")
+
+
 @app.post("/api/v1/tunein/play-podcast", tags=["soundcork-api"])
 async def api_play_podcast(request: Request):
     """
@@ -2551,24 +2616,7 @@ async def api_play_podcast(request: Request):
         raise HTTPException(status_code=400, detail="guide_id must be an episode (t...) or station (s...) id")
 
     if not guide_id:
-        # Resolve a tun.in / tunein.com URL to a guide id
-        try:
-            async with _httpx.AsyncClient(
-                follow_redirects=True, timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}
-            ) as client:
-                r = await client.get(url)
-                final_page = str(r.url)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not resolve URL: {e}")
-        m = re.search(r"topicid=(\d+)", final_page, re.IGNORECASE)
-        if m:
-            guide_id = f"t{m.group(1)}"
-        else:
-            m = re.search(r"[/\-]([tps]\d+)(?:[/?]|$)", final_page, re.IGNORECASE)
-            if m:
-                guide_id = m.group(1)
-        if not guide_id:
-            raise HTTPException(status_code=400, detail=f"Could not extract guide ID from: {final_page}")
+        guide_id = await _extract_tunein_guide_id(url)
 
     stream_url, resolved_title = await _resolve_tunein_stream(guide_id)
     title = (body.get("title") or "").strip() or resolved_title

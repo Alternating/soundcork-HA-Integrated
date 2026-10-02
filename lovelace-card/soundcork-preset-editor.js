@@ -143,6 +143,14 @@ class SoundcorkPresetEditor extends HTMLElement {
     } catch(e) { return false; }
   }
 
+  _pickMasterIdx(reachable) {
+    // Prefer Kitchen (always-on interior speaker) as zone master, same as
+    // the preset flows - outdoor speakers like The Deck can drop offline
+    // mid-session and take the whole zone down with them.
+    const idx = reachable.findIndex(t => t.ip === "192.168.1.214");
+    return idx >= 0 ? idx : 0;
+  }
+
   async _playWithZone(xml) {
     const targets = this._getTargetSpeakers();
     if (!targets.length) return;
@@ -617,6 +625,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     .ep-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
     .back-btn{background:var(--secondary-background-color,#2a2a40);border:none;cursor:pointer;color:var(--primary-text-color);font-size:16px;padding:8px 12px;border-radius:8px;flex-shrink:0}
     .back-btn:hover{background:rgba(3,169,244,.2)}
+    .fav-del{background:none;border:none;cursor:pointer;font-size:14px;color:var(--secondary-text-color);padding:4px 6px;flex-shrink:0;transition:color .15s}
+    .fav-del:hover{color:#ff6b6b}
     .pod-adv{margin-top:12px}
     .pod-adv summary{font-size:11px;color:var(--secondary-text-color);cursor:pointer;margin-bottom:8px}
   `; }
@@ -653,7 +663,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
     const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
     if (!reachable.length) { this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
-    const master = reachable[0], slaves = reachable.slice(1);
+    const masterIdx = this._pickMasterIdx(reachable);
+    const master = reachable[masterIdx], slaves = reachable.filter((_, i) => i !== masterIdx);
     this._podcastLoading = true;
     this._podcastStatus = {type:'loading', msg:'Looking up episode...'};
     this._render();
@@ -721,6 +732,31 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._render();
   }
 
+  async _addFavoriteByUrl(url) {
+    if (!url || !url.trim()) return;
+    this._podcastStatus = {type:'loading', msg:'Resolving URL...'};
+    this._render();
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/tunein/resolve-url`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url: url.trim() })
+      });
+      const data = await r.json();
+      if (!r.ok || !data.guide_id) throw new Error(data.detail || 'Could not resolve that URL');
+      const name = data.kind === 'episode' && data.show_title ? `${data.show_title}: ${data.name}` : data.name;
+      const fr = await fetch(`${this._baseUrl}/api/v1/podcasts/favorites`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ guide_id: data.guide_id, name, image: data.image || '' })
+      });
+      const fd = await fr.json();
+      this._podcastFavorites = fd.favorites || [];
+      this._podcastStatus = {type:'success', msg:`Added ${data.kind}: ${name}`};
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg: e.message || 'Could not add favorite'};
+    }
+    this._render();
+    setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 6000);
+  }
+
   async _podcastSearch(query) {
     if (!query.trim()) return;
     this._podcastQuery = query;
@@ -772,7 +808,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._render();
     const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
     if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
-    const master = reachable[0], slaves = reachable.slice(1);
+    const masterIdx = this._pickMasterIdx(reachable);
+    const master = reachable[masterIdx], slaves = reachable.filter((_, i) => i !== masterIdx);
     try {
       const r = await fetch(`${this._baseUrl}/api/v1/tunein/play-podcast`, {
         method:'POST', headers:{'Content-Type':'application/json'},
@@ -825,10 +862,26 @@ class SoundcorkPresetEditor extends HTMLElement {
           </div>
           <div class="results">${eps}</div>`;
       } else {
-        const favsHtml = this._podcastFavorites.length ? `
-          <div class="fav-row">${this._podcastFavorites.map((f, i) => `
-            <span class="fav-chip" data-i="${i}" title="${this._esc(f.name)}">${f.image?`<img src="${this._esc(f.image)}" alt=""/>`:''}<span>${this._esc(f.name)}</span></span>`).join('')}
-          </div>` : '';
+        const favRows = this._podcastFavorites.map((f, i) => {
+          const kind = f.guide_id.startsWith('p') ? 'show' : f.guide_id.startsWith('t') ? 'episode' : 'station';
+          const actionBtn = kind === 'show'
+            ? `<button class="play-btn fav-eps" data-i="${i}">Episodes</button>`
+            : `<button class="play-btn fav-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>`;
+          return `<div class="result">
+            <div class="result-art">${f.image?`<img src="${this._esc(f.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
+            <div class="result-info"><div class="result-name">${this._esc(f.name)}</div><div class="result-sub">${kind}</div></div>
+            ${actionBtn}
+            <button class="fav-del" data-i="${i}" title="Remove favorite">&#x2715;</button>
+          </div>`;
+        }).join('');
+        const favsHtml = `
+          <div class="pandora-acct-header">Podcast Favorites</div>
+          <div class="search-row">
+            <input class="search-input" id="fav-url" type="text" placeholder="Add by TuneIn URL (tun.in or tunein.com)" spellcheck="false" autocomplete="off"/>
+            <button class="search-btn" id="fav-add" ${this._podcastLoading?'disabled':''}>Add</button>
+          </div>
+          ${this._podcastFavorites.length ? `<div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : '<div class="empty" style="padding:6px 0 12px">No favorites yet - paste a TuneIn URL above or &#x2661; a search result below</div>'}
+          <div class="pandora-acct-header">Search TuneIn</div>`;
         let resultsHtml = '';
         if (this._podcastSearching) resultsHtml = '<div class="loading">Searching TuneIn...</div>';
         else if (this._podcastShows.length || this._podcastStations.length) {
@@ -896,12 +949,12 @@ class SoundcorkPresetEditor extends HTMLElement {
           if (ep) this._playGuideId(ep.guide_id, ep.title, ep.image || this._podcastShow.image);
         }));
       } else {
-        this.shadowRoot.querySelectorAll('.fav-chip').forEach(c => c.addEventListener('click', () => {
-          const f = this._podcastFavorites[parseInt(c.dataset.i)];
-          if (!f) return;
-          if (f.guide_id.startsWith('p')) this._openEpisodes(f);
-          else this._playGuideId(f.guide_id, f.name, f.image);
-        }));
+        const favUrl = this.shadowRoot.getElementById('fav-url');
+        this.shadowRoot.getElementById('fav-add')?.addEventListener('click', () => this._addFavoriteByUrl(favUrl.value));
+        favUrl?.addEventListener('keydown', e => { if (e.key === 'Enter') this._addFavoriteByUrl(favUrl.value); });
+        this.shadowRoot.querySelectorAll('.fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._podcastFavorites[parseInt(b.dataset.i)]; if (f) this._openEpisodes(f); }));
+        this.shadowRoot.querySelectorAll('.fav-play').forEach(b => b.addEventListener('click', () => { const f = this._podcastFavorites[parseInt(b.dataset.i)]; if (f) this._playGuideId(f.guide_id, f.name, f.image); }));
+        this.shadowRoot.querySelectorAll('.fav-del').forEach(b => b.addEventListener('click', () => { const f = this._podcastFavorites[parseInt(b.dataset.i)]; if (f) this._toggleFavorite(f); }));
         const si = this.shadowRoot.getElementById('pod-search');
         const sb = this.shadowRoot.getElementById('pod-search-btn');
         sb?.addEventListener('click', () => this._podcastSearch(si.value));
