@@ -2635,6 +2635,8 @@ async def api_play_podcast(request: Request):
         if latest is None:
             raise HTTPException(status_code=404, detail=f"No episodes found for show {guide_id}")
         guide_id = latest["guide_id"]
+        if not (body.get("title") or "").strip():
+            body["title"] = latest.get("text", "")
         if not (body.get("image") or "").strip():
             body["image"] = latest.get("image", "")
 
