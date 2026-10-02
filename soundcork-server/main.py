@@ -1636,11 +1636,40 @@ def api_list_speakers():
 
 @app.get("/api/v1/speakers/{ip}/now-playing", tags=["soundcork-api"])
 async def api_now_playing(ip: str):
-    """Get current now-playing state from a speaker."""
+    """Get current now-playing state from a speaker, zone-aware.
+
+    Bose firmware quirk (observed 2026-10-03): a zone SLAVE keeps the
+    ContentItem/metadata of whatever it last selected itself (e.g. WMSE)
+    even while it is audibly playing the zone master's stream. The
+    official app papers over this by showing the master's now-playing on
+    slaves; we do the same here so HA entities and every dashboard tile
+    reflect what the speaker is actually playing. The slave's own
+    deviceID is preserved in the returned XML so per-speaker consumers
+    keep matching correctly.
+    """
     try:
         async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
             r = await client.get(_speaker_url(ip, "/nowPlaying"))
-            return Response(content=r.content, media_type="application/xml", status_code=r.status_code)
+            content = r.content
+            if r.status_code == 200 and b"STANDBY" not in content:
+                try:
+                    own_id = (re.search(rb'nowPlaying[^>]*deviceID="([^"]+)"', content) or [None, b""])[1]
+                    zr = await client.get(_speaker_url(ip, "/getZone"))
+                    zm = re.search(rb'<zone[^>]*master="([^"]+)"', zr.content)
+                    zs = re.search(rb'senderIPAddress="([^"]+)"', zr.content)
+                    if zm and zs and own_id and zm.group(1) != own_id:
+                        master_ip = zs.group(1).decode()
+                        mr = await client.get(_speaker_url(master_ip, "/nowPlaying"))
+                        if mr.status_code == 200 and b"STANDBY" not in mr.content:
+                            content = re.sub(
+                                rb'(<nowPlaying[^>]*deviceID=")[^"]+(")',
+                                rb"\g<1>" + own_id + rb"\g<2>",
+                                mr.content,
+                                count=1,
+                            )
+                except Exception:
+                    pass  # zone lookup is best-effort; fall back to own state
+            return Response(content=content, media_type="application/xml", status_code=r.status_code)
     except _httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {ip}")
     except _httpx.TimeoutException:
