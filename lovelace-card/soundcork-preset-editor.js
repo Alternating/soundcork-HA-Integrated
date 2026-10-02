@@ -1139,11 +1139,14 @@ class SoundcorkPresetEditor extends HTMLElement {
             <button class="fav-del pk-fav-del" data-i="${i}" title="Remove favorite">&#x2715;</button>
           </div>`).join('');
         bodyHtml = `
-          ${this._pkFavorites.length ? `<div class="pandora-acct-header">Pushkin Favorites</div><div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : ''}
-          <div class="pandora-acct-header">All Shows</div>
+          <div class="pandora-acct-header">Pushkin Favorites</div>
+          ${this._pkFavorites.length ? `<div class="results" style="max-height:230px;margin-bottom:10px">${favRows}</div>` : '<div class="empty" style="padding:6px 0 12px">No favorites yet - &#x2661; a show below</div>'}
+          <div class="pandora-acct-header">Search Pushkin</div>
           <div class="search-row">
-            <input class="search-input" id="pk-filter" type="text" placeholder="Filter shows (e.g. Revisionist)" value="${this._esc(this._pkFilter)}"/>
+            <input class="search-input" id="pk-filter" type="text" placeholder="Search Pushkin shows (e.g. Revisionist History)" value="${this._esc(this._pkFilter)}"/>
+            <button class="search-btn" id="pk-filter-btn">Search</button>
           </div>
+          <div class="pandora-acct-header">Shows</div>
           <div class="results" id="pk-show-list">${this._pkShowRowsHtml()}</div>`;
       }
 
@@ -1183,6 +1186,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         pf?.addEventListener('keydown', e => e.stopPropagation());
         pf?.addEventListener('keyup', e => e.stopPropagation());
         pf?.addEventListener('input', () => { this._pkFilter = pf.value; this._pkRefreshShowList(); });
+        this.shadowRoot.getElementById('pk-filter-btn')?.addEventListener('click', () => { this._pkFilter = pf ? pf.value : ''; this._pkRefreshShowList(); });
         this._pkBindShowRows();
         this.shadowRoot.querySelectorAll('.pk-fav-play').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkPlayLatest(f); }));
         this.shadowRoot.querySelectorAll('.pk-fav-eps').forEach(b => b.addEventListener('click', () => { const f = this._pkFavorites[parseInt(b.dataset.i)]; if (f) this._pkOpenEpisodes(f); }));
