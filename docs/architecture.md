@@ -103,6 +103,18 @@ Correct flow:
 
 > **2026-08-15 — LOCAL_INTERNET_RADIO preset restore silently broke playback.** Our own preset-restore endpoints (`api_restore_preset_backup`, `api_restore_all_from_baseline` in `main.py`) were pushing the bare `Presets.xml` URL straight to `/storePreset`, skipping the orion-wrap step above. Presets looked structurally correct and returned HTTP 200, but nothing actually played on any speaker. Fixed by adding `_wrap_local_internet_radio_content_item()` to both restore functions. Full writeup, diagnostic playbook, and MCP tools used: [`docs/incidents/2026-08-15-preset-playback-outage.md`](incidents/2026-08-15-preset-playback-outage.md).
 
+### Playing a TuneIn Podcast Episode or Searched Station (browse flow)
+
+Podcast episodes are finite MP3 downloads behind multi-hop ad-tracker redirect chains (podtrac → pdst → pscrb → CDN), not live streams — SoundTouch 10 firmware chokes on the chain, and the speaker's own TuneIn client depends on Bose's shut-down backend. So playback reuses the LOCAL_INTERNET_RADIO orion wrap above instead of a `TUNEIN`-source ContentItem (verified on hardware 2026-10-01: wrapped episode reached `PLAY_STATE` in under 2 s).
+
+1. Card searches `GET /api/v1/tunein/search?q=...` — podcast shows come back as `p<digits>` guide ids, live stations as `s<digits>` (`m<digits>` artist entries are noise and filtered out)
+2. Card lists a show's recent episodes via `GET /api/v1/tunein/episodes?id=p...` (TuneIn nests the ~50 episodes under `body[0].children`, each a `t<digits>` topic id)
+3. Card plays via `POST /api/v1/tunein/play-podcast` with `guide_id` (`t...` episode or `s...` station; a `url` of a tun.in/tunein.com link also still works)
+4. Server resolves the real stream URL from `Tune.ashx`, pre-follows the redirect chain with a plain GET (a Range probe would get its params baked into the final CDN URL), wraps the final URL in the orion `data=` payload, and `/select`s it on the master
+5. The master is confirmed at `PLAY_STATE`/`BUFFERING_STATE` before slaves are zoned — zoning an unconfirmed master drops the group into `INVALID_SOURCE`
+
+Favorite shows/stations are stored server-side in `{data_dir}/podcast_favorites.json` via `GET/POST /api/v1/podcasts/favorites` and `DELETE /api/v1/podcasts/favorites/{guide_id}`.
+
 ### Spotify
 
 Spotify playback does **not** go through soundcork or Bose servers. See [Spotify Guide](spotify.md) for details.

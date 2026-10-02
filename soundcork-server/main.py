@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -2388,101 +2389,228 @@ async def api_zone_clear(ip: str):
 
 
 # ---------------------------------------------------------------------------
-# Podcast URL resolver and player
-# Accepts tun.in short URLs or full tunein.com podcast URLs,
-# resolves the multi-hop stream chain, and returns a playable stream URL
-# compatible with SoundTouch 10 hardware (HTTP/1.1, no HTTP/2 redirects).
+# TuneIn podcast browsing, favorites, and playback
+#
+# Playback deliberately does NOT hand the speaker a TUNEIN-source
+# ContentItem (location="/v1/playback/station/{id}"): that routes through
+# the speaker's own TuneIn client against Bose's shut-down backend and
+# fails more often than it works. Instead the real stream URL is resolved
+# from TuneIn's OPML API, the multi-hop redirect chain (podtrac/pdst/
+# pscrb/...) is pre-followed because SoundTouch 10 firmware chokes on it,
+# and the final URL is played through the same LOCAL_INTERNET_RADIO orion
+# wrap the preset system uses (see _wrap_local_internet_radio_content_item).
+# Verified on hardware 2026-10-01: The Deck reached PLAY_STATE in under
+# 2 seconds for a The Daily episode routed this way.
 # ---------------------------------------------------------------------------
+
+from urllib.parse import quote as _urlquote
+from xml.sax.saxutils import escape as _xml_escape, quoteattr as _xml_quoteattr
+
+_PODCAST_FAVORITES_PATH = os.path.join(settings.data_dir, "podcast_favorites.json")
+
+
+def _load_podcast_favorites() -> list:
+    try:
+        with open(_PODCAST_FAVORITES_PATH, "r") as f:
+            favs = _json.load(f)
+            return favs if isinstance(favs, list) else []
+    except Exception:
+        return []
+
+
+def _save_podcast_favorites(favs: list) -> None:
+    with open(_PODCAST_FAVORITES_PATH, "w") as f:
+        _json.dump(favs, f, indent=2)
+
+
+@app.get("/api/v1/podcasts/favorites", tags=["soundcork-api"])
+async def api_podcast_favorites():
+    """List favorited podcast shows (p...) and stations (s...)."""
+    return {"favorites": _load_podcast_favorites()}
+
+
+@app.post("/api/v1/podcasts/favorites", tags=["soundcork-api"])
+async def api_podcast_favorite_add(request: Request):
+    """Favorite a show or station. Body: {guide_id, name, image?}."""
+    body = await request.json()
+    guide_id = (body.get("guide_id") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not re.fullmatch(r"[ps]\d+", guide_id) or not name:
+        raise HTTPException(status_code=400, detail="guide_id (p.../s...) and name are required")
+    favs = [f for f in _load_podcast_favorites() if f.get("guide_id") != guide_id]
+    favs.append({"guide_id": guide_id, "name": name, "image": (body.get("image") or "").strip()})
+    _save_podcast_favorites(favs)
+    return {"favorites": favs}
+
+
+@app.delete("/api/v1/podcasts/favorites/{guide_id}", tags=["soundcork-api"])
+async def api_podcast_favorite_delete(guide_id: str):
+    """Remove a favorite by guide id."""
+    favs = [f for f in _load_podcast_favorites() if f.get("guide_id") != guide_id]
+    _save_podcast_favorites(favs)
+    return {"favorites": favs}
+
+
+@app.get("/api/v1/tunein/episodes", tags=["soundcork-api"])
+async def api_tunein_episodes(id: str):
+    """Recent episodes for a TuneIn podcast show (guide id like p952868).
+
+    TuneIn nests the ~50 most recent episodes under body[0].children
+    (key="topics"), NOT directly in body.
+    """
+    if not re.fullmatch(r"p\d+", id):
+        raise HTTPException(status_code=400, detail="id must be a podcast show guide id like p952868")
+    try:
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(f"https://opml.radiotime.com/Tune.ashx?c=pbrowse&id={id}&render=json")
+            data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TuneIn episode list failed: {e}")
+    episodes = []
+    for section in data.get("body", []):
+        for child in section.get("children", []):
+            if child.get("item") != "topic" or not child.get("guide_id"):
+                continue
+            episodes.append(
+                {
+                    "guide_id": child["guide_id"],
+                    "title": child.get("text", ""),
+                    "date": child.get("subtext", ""),
+                    "duration_seconds": child.get("topic_duration"),
+                    "image": child.get("image", ""),
+                }
+            )
+    return {"show_id": id, "episodes": episodes}
+
+
+def _orion_station_location(name: str, image_url: str, stream_url: str) -> str:
+    """Wrap an arbitrary stream URL the way the webui wraps LOCAL_INTERNET_RADIO
+    presets: base64 {name,imageUrl,streamUrl} through the orion bmx adapter."""
+    payload = _base64.b64encode(
+        _json.dumps({"name": name, "imageUrl": image_url, "streamUrl": stream_url}).encode()
+    ).decode()
+    return f"{settings.base_url}/core02/svc-bmx-adapter-orion/prod/orion/station?data={_urlquote(payload)}"
+
+
+async def _resolve_tunein_stream(guide_id: str) -> tuple:
+    """guide_id (t.../s...) -> (final stream URL, title).
+
+    Pre-follows the redirect chain server-side with a plain GET (headers
+    only -- a Range probe gets its params baked into the final CDN URL).
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        async with _httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+            r = await client.get(f"https://opml.radiotime.com/Tune.ashx?id={guide_id}&render=json")
+            tune = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TuneIn OPML error: {e}")
+    body_items = tune.get("body", [])
+    raw_url = body_items[0].get("url", "") if body_items else ""
+    if not raw_url:
+        raise HTTPException(status_code=404, detail=f"No stream found for {guide_id}")
+    title = tune.get("head", {}).get("title", "") or "TuneIn"
+    final_url = raw_url
+    try:
+        async with _httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
+            async with client.stream("GET", raw_url) as resp:
+                final_url = str(resp.url)
+    except Exception:
+        pass  # fall back to the unresolved URL; the orion proxy may still cope
+    return final_url, title
+
 
 @app.post("/api/v1/tunein/play-podcast", tags=["soundcork-api"])
 async def api_play_podcast(request: Request):
     """
-    Resolve a TuneIn podcast URL and play it on speakers.
-    Handles tun.in short URLs and full tunein.com episode URLs.
-    Pre-resolves multi-hop HTTP redirects for SoundTouch 10 compatibility.
+    Play a TuneIn podcast episode (t...) or live station (s...) on speakers.
 
     Body JSON:
     {
-      "url": "http://tun.in/tLU13Y",
+      "guide_id": "t580783066",          # from /api/v1/tunein/episodes or search
+      "url": "http://tun.in/tLU13Y",     # alternative to guide_id
+      "title": "...", "image": "...",    # optional display metadata
       "master_ip": "192.168.1.41",
       "master_device_id": "587A6274B5C4",
       "slaves": [{"ip": "...", "device_id": "..."}]
     }
-    """
-    import re
-    import urllib.request as _urllib
 
+    The master is confirmed playing before slaves are zoned -- zoning an
+    unconfirmed master drops the whole group into INVALID_SOURCE (same
+    choreography the lovelace card uses for presets).
+    """
     body = await request.json()
-    url = body.get("url", "").strip()
+    guide_id = (body.get("guide_id") or "").strip()
+    url = (body.get("url") or "").strip()
     master_ip = body.get("master_ip", "")
     slaves = body.get("slaves", [])
 
-    if not url or not master_ip:
-        raise HTTPException(status_code=400, detail="url and master_ip are required")
-
-    # Step 1: Follow redirects to get canonical tunein.com URL
-    try:
-        req = _urllib.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with _urllib.urlopen(req, timeout=10) as r:
-            final_url = r.url
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not resolve URL: {e}")
-
-    # Step 2: Extract topicId or guide ID
-    guide_id = None
-    topic_match = re.search(r'topicid=(\d+)', final_url, re.IGNORECASE)
-    if topic_match:
-        guide_id = f"t{topic_match.group(1)}"
+    if not master_ip or not (guide_id or url):
+        raise HTTPException(status_code=400, detail="master_ip and guide_id (or url) are required")
+    if guide_id and not re.fullmatch(r"[ts]\d+", guide_id):
+        raise HTTPException(status_code=400, detail="guide_id must be an episode (t...) or station (s...) id")
 
     if not guide_id:
-        # Try extracting t/p/s-prefixed ID from path
-        id_match = re.search(r'[/\-]([tps]\d+)(?:[/?]|$)', final_url, re.IGNORECASE)
-        if id_match:
-            guide_id = id_match.group(1)
+        # Resolve a tun.in / tunein.com URL to a guide id
+        try:
+            async with _httpx.AsyncClient(
+                follow_redirects=True, timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}
+            ) as client:
+                r = await client.get(url)
+                final_page = str(r.url)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not resolve URL: {e}")
+        m = re.search(r"topicid=(\d+)", final_page, re.IGNORECASE)
+        if m:
+            guide_id = f"t{m.group(1)}"
+        else:
+            m = re.search(r"[/\-]([tps]\d+)(?:[/?]|$)", final_page, re.IGNORECASE)
+            if m:
+                guide_id = m.group(1)
+        if not guide_id:
+            raise HTTPException(status_code=400, detail=f"Could not extract guide ID from: {final_page}")
 
-    if not guide_id:
-        raise HTTPException(status_code=400, detail=f"Could not extract guide ID from: {final_url}")
+    stream_url, resolved_title = await _resolve_tunein_stream(guide_id)
+    title = (body.get("title") or "").strip() or resolved_title
+    image = (body.get("image") or "").strip()
 
-    # Step 3: Get stream URL from TuneIn OPML Tune.ashx
-    try:
-        tune_req = _urllib.Request(
-            f"https://opml.radiotime.com/Tune.ashx?id={guide_id}&render=json",
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        import json as _json
-        with _urllib.urlopen(tune_req, timeout=10) as r:
-            tune_data = _json.loads(r.read().decode("utf-8", errors="ignore"))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TuneIn OPML error: {e}")
-
-    body_items = tune_data.get("body", [])
-    if not body_items:
-        raise HTTPException(status_code=404, detail="No stream found for this episode")
-
-    raw_stream_url = body_items[0].get("url", "")
-    episode_title = tune_data.get("head", {}).get("title", "Podcast Episode")
-
-    if not raw_stream_url:
-        raise HTTPException(status_code=404, detail="No stream URL in TuneIn response")
-
-    # Step 4: Build ContentItem using TUNEIN source with guide_id
-    # This lets the speaker's own TuneIn client handle stream resolution,
-    # avoiding issues with expiring session tokens from pre-resolved URLs.
+    location = _orion_station_location(title, image, stream_url)
     xml = (
-        f'<ContentItem source="TUNEIN" type="stationurl" '
-        f'location="/v1/playback/station/{guide_id}" isPresetable="false">'
-        f'<itemName>{episode_title}</itemName>'
-        f'</ContentItem>'
+        f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
+        f'location={_xml_quoteattr(location)} isPresetable="false">'
+        f"<itemName>{_xml_escape(title)}</itemName>"
+        f"<containerArt>{_xml_escape(image)}</containerArt>"
+        f"</ContentItem>"
     )
 
-    # Create zone if slaves provided
-    if slaves:
-        members = "".join(
-            f'<member ipaddress="{s["ip"]}">{s["device_id"]}</member>'
-            for s in slaves
-        )
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            await client.post(
+                _speaker_url(master_ip, "/select"),
+                content=xml.encode(),
+                headers={"Content-Type": "application/xml"},
+            )
+    except _httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {master_ip}")
+    except _httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Speaker at {master_ip} timed out")
+
+    confirmed = False
+    for _ in range(10):
+        await asyncio.sleep(1.0)
+        try:
+            async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                np = await client.get(_speaker_url(master_ip, "/nowPlaying"))
+            if "PLAY_STATE" in np.text or "BUFFERING_STATE" in np.text:
+                confirmed = True
+                break
+        except Exception:
+            pass
+
+    if slaves and confirmed:
+        members = "".join(f'<member ipaddress="{s["ip"]}">{s["device_id"]}</member>' for s in slaves)
         zone_xml = (
-            f'<zone master="{body.get("master_device_id","")}" '
+            f'<zone master="{body.get("master_device_id", "")}" '
             f'senderIPAddress="{master_ip}">{members}</zone>'
         )
         try:
@@ -2494,24 +2622,24 @@ async def api_play_podcast(request: Request):
                 )
         except Exception:
             pass
-        import asyncio as _asyncio
-        await _asyncio.sleep(0.3)
+    elif slaves:
+        # Master never confirmed; play independently so audio still happens
+        for s in slaves:
+            try:
+                async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                    await client.post(
+                        _speaker_url(s["ip"], "/select"),
+                        content=xml.encode(),
+                        headers={"Content-Type": "application/xml"},
+                    )
+            except Exception:
+                pass
 
-    # Play on master
-    try:
-        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
-            r = await client.post(
-                _speaker_url(master_ip, "/select"),
-                content=xml.encode(),
-                headers={"Content-Type": "application/xml"},
-            )
-        return {
-            "success": True,
-            "guide_id": guide_id,
-            "title": episode_title,
-            "speakers": len(slaves) + 1
-        }
-    except _httpx.ConnectError:
-        raise HTTPException(status_code=503, detail=f"Cannot reach speaker at {master_ip}")
-    except _httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail=f"Speaker at {master_ip} timed out")
+    return {
+        "success": True,
+        "guide_id": guide_id,
+        "title": title,
+        "speakers": len(slaves) + 1,
+        "play_confirmed": confirmed,
+        "stream_url": stream_url,
+    }
