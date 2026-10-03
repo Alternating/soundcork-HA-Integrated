@@ -2598,11 +2598,43 @@ async def api_tunein_popular():
 
 def _orion_station_location(name: str, image_url: str, stream_url: str) -> str:
     """Wrap an arbitrary stream URL the way the webui wraps LOCAL_INTERNET_RADIO
-    presets: base64 {name,imageUrl,streamUrl} through the orion bmx adapter."""
+    presets: base64 {name,imageUrl,streamUrl} through the orion bmx adapter.
+    Self-contained (used for persisted presets)."""
     payload = _base64.b64encode(
         _json.dumps({"name": name, "imageUrl": image_url, "streamUrl": stream_url}).encode()
     ).decode()
     return f"{settings.base_url}/core02/svc-bmx-adapter-orion/prod/orion/station?data={_urlquote(payload)}"
+
+
+# Short-reference variant for EPHEMERAL playback (queue / play-stream). Some
+# resolved URLs (notably iHeart's, which embed the full episode title + session
+# tokens in the path) make the base64 orion location so long that the ContentItem
+# POST to the speaker's /select is rejected with HTTP 413. We instead stash the
+# base64 payload under a short key and hand the speaker a tiny /scs/<key> URL.
+_scs_store: dict[str, str] = {}
+_SCS_MAX = 300
+
+
+def _orion_short_location(name: str, image_url: str, stream_url: str) -> str:
+    payload = _base64.b64encode(
+        _json.dumps({"name": name, "imageUrl": image_url, "streamUrl": stream_url}).encode()
+    ).decode()
+    key = _secrets_mod.token_hex(8)
+    _scs_store[key] = payload
+    if len(_scs_store) > _SCS_MAX:  # bounded; drop oldest
+        for old in list(_scs_store)[: len(_scs_store) - _SCS_MAX]:
+            _scs_store.pop(old, None)
+    return f"{settings.base_url}/scs/{key}"
+
+
+@app.get("/scs/{key}", tags=["bmx"])
+def soundcork_short_stream(key: str) -> BmxPlaybackResponse:
+    """Serve the orion playback descriptor for a short-key ephemeral stream
+    (same format as the orion adapter; keeps the ContentItem small)."""
+    payload = _scs_store.get(key)
+    if not payload:
+        raise HTTPException(status_code=404, detail="unknown stream key")
+    return play_custom_stream(payload)
 
 
 async def _resolve_tunein_stream(guide_id: str) -> tuple:
@@ -2870,7 +2902,7 @@ async def _play_wrapped_stream(
         except Exception:
             pass  # fall back to the unresolved URL; the orion proxy may still cope
 
-    location = _orion_station_location(title, image, stream_url)
+    location = _orion_short_location(title, image, stream_url)
     xml = (
         f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
         f'location={_xml_quoteattr(location)} isPresetable="false">'
