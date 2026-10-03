@@ -79,7 +79,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       else if (this._mode === "nowplaying") { this._loadNowPlaying(); }
       else if (this._mode !== "speaker") { this._loadPresets(); }
     }
-    if (this._mode === "speaker" || this._mode === "pandora") this._render();
+    if ((this._mode === "speaker" && !this._volDragging) || this._mode === "pandora") this._render();
   }
 
   get _mode() { return this._config.mode || "editor"; }
@@ -2092,27 +2092,25 @@ class SoundcorkPresetEditor extends HTMLElement {
     }
     if (this._mode === "speaker") {
       this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card>${this._renderSpeaker()}</ha-card>`;
-      const adjustVolume = async (delta) => {
-        // Prefer a playing speaker for accurate volume reading
-        const playingId = this._speakers.find(id => {
-          const s = this._hass && this._hass.states[id];
-          return s && s.state === "playing";
-        }) || this._speakers.find(id => {
-          const s = this._hass && this._hass.states[id];
-          return s && s.state !== "unavailable" && (s.attributes.volume_level || 0) > 0;
-        });
-        const state = playingId && this._hass && this._hass.states[playingId];
-        const currentVol = state ? Math.round((state.attributes.volume_level || 0) * 100) : 0;
-        const newVol = Math.max(0, Math.min(100, currentVol + delta));
-        // Update bar immediately for instant feedback
-        const bar = this.shadowRoot.getElementById("vol-bar");
-        const pct = this.shadowRoot.getElementById("vol-pct");
-        if (bar) bar.style.width = newVol + "%";
-        if (pct) pct.textContent = newVol + "%";
-        await this._setVolumeAll(newVol);
+      // Per-speaker volume. The slider targets THIS card's single speaker.
+      // _volDragging suppresses the hass-driven re-render while the user is
+      // interacting, so a background state push can't snap the slider back.
+      const vs = this.shadowRoot.getElementById("vol-slider");
+      const vv = this.shadowRoot.getElementById("vol-val");
+      const setVol = (v) => {
+        const ip = this._getSpeakerIps()[0];
+        if (ip) fetch(`${this._baseUrl}/api/v1/speakers/${ip}/volume`, {
+          method: "POST", headers: {"Content-Type":"application/xml"}, body: `<volume>${Math.max(0,Math.min(100,parseInt(v)||0))}</volume>`
+        }).catch(()=>{});
       };
-      this.shadowRoot.getElementById("vol-up")?.addEventListener("click", () => adjustVolume(5));
-      this.shadowRoot.getElementById("vol-down")?.addEventListener("click", () => adjustVolume(-5));
+      vs?.addEventListener("pointerdown", () => { this._volDragging = true; });
+      vs?.addEventListener("input", () => { if (vv) vv.textContent = vs.value + "%"; });
+      vs?.addEventListener("change", () => {
+        setVol(vs.value);
+        // keep guarding briefly so the optimistic value isn't overwritten
+        // before HA's state catches up to the new volume
+        setTimeout(() => { this._volDragging = false; }, 1500);
+      });
       this.shadowRoot.getElementById("spk-pwr")?.addEventListener("click", () => {
         const np = this._data && this._data.now_playing;
         const isOff = !np || !np.source || np.source === "STANDBY";
