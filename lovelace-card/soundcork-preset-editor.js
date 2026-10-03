@@ -56,7 +56,6 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._spEpisodes = [];
     this._spLoading = false;
     this._spPlaylist = []; // soundcork-managed editable playlist
-    this._spQueueOpen = false;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -77,6 +76,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       else if (this._mode === "pushkin") { this._loadPushkin(); }
       else if (this._mode === "iheart") { this._loadIheart(); }
       else if (this._mode === "spotify") { this._loadSpotify(); }
+      else if (this._mode === "nowplaying") { this._loadNowPlaying(); }
       else if (this._mode !== "speaker") { this._loadPresets(); }
     }
     if (this._mode === "speaker" || this._mode === "pandora") this._render();
@@ -1119,6 +1119,14 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._render();
   }
 
+  async _loadNowPlaying() {
+    try {
+      const pr = await fetch(`${this._baseUrl}/api/v1/spotify/playlist`, {signal: AbortSignal.timeout(6000)});
+      this._spPlaylist = (await pr.json()).items || [];
+    } catch(e) {}
+    this._render();
+  }
+
   _spIsFavorite(uri) { return this._spFavorites.some(f => f.guide_id === uri); }
 
   async _spToggleFavorite(show) {
@@ -1178,12 +1186,18 @@ class SoundcorkPresetEditor extends HTMLElement {
   _spStartPolling() {
     if (this._spPollTimer) return;
     const tick = async () => {
-      if (this._mode !== 'spotify' || !this.isConnected) { this._spStopPolling(); return; }
+      if (this._mode !== 'nowplaying' || !this.isConnected) { this._spStopPolling(); return; }
       try {
         const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal: AbortSignal.timeout(6000)});
         this._spNow = await r.json();
         this._spNowAt = Date.now();
       } catch(e) { /* keep last state on a transient failure */ }
+      // also resync the playlist so adds from the provider tiles show up here
+      try {
+        const pr = await fetch(`${this._baseUrl}/api/v1/spotify/playlist`, {signal: AbortSignal.timeout(6000)});
+        this._spPlaylist = (await pr.json()).items || [];
+        this._spRenderQueue();
+      } catch(e) {}
       this._spUpdateNowBar();
     };
     tick();
@@ -1231,14 +1245,11 @@ class SoundcorkPresetEditor extends HTMLElement {
             '<button class="np-btn" id="np-prev" title="Previous">&#x23EE;</button>' +
             '<button class="np-btn np-play" id="np-playpause" title="Play/Pause"></button>' +
             '<button class="np-btn" id="np-next" title="Next">&#x23ED;</button>' +
-            '<button class="np-btn np-queue-btn" id="np-queue-btn" title="Queue">&#x2630;</button>' +
           '</div>' +
-          '<div class="np-queue" id="np-queue"></div>' +
         '</div>';
       wrap.querySelector('#np-prev').addEventListener('click', () => this._spControl('previous'));
       wrap.querySelector('#np-next').addEventListener('click', () => this._spControl('next'));
       wrap.querySelector('#np-playpause').addEventListener('click', () => this._spControl(this._spNow && this._spNow.playing ? 'pause' : 'play'));
-      wrap.querySelector('#np-queue-btn').addEventListener('click', () => this._spToggleQueue());
       wrap.querySelector('#np-seek').addEventListener('click', (e) => {
         const d = this._spNow && this._spNow.duration_ms; if (!d) return;
         const rect = e.currentTarget.getBoundingClientRect();
@@ -1246,9 +1257,6 @@ class SoundcorkPresetEditor extends HTMLElement {
         this._spControl('seek', Math.round(frac * d));
       });
     }
-    const qbtn = wrap.querySelector('#np-queue-btn');
-    if (qbtn) qbtn.classList.toggle('active', !!this._spQueueOpen);
-    if (build && this._spQueueOpen) this._spRenderQueue();
     wrap.querySelector('#np-art').innerHTML = n.image ? `<img src="${this._esc(n.image)}" alt=""/>` : '&#x1F3A7;';
     wrap.querySelector('#np-title').textContent = n.title;
     wrap.querySelector('#np-artist').textContent = n.artist || '';
@@ -1258,18 +1266,9 @@ class SoundcorkPresetEditor extends HTMLElement {
     wrap.querySelector('#np-playpause').innerHTML = n.playing ? '&#x23F8;' : '&#x25B6;';
   }
 
-  async _spToggleQueue() {
-    this._spQueueOpen = !this._spQueueOpen;
-    if (this._spQueueOpen) await this._spLoadPlaylist();
-    this._spRenderQueue();
-    const qbtn = this.shadowRoot && this.shadowRoot.querySelector('#np-queue-btn');
-    if (qbtn) qbtn.classList.toggle('active', this._spQueueOpen);
-  }
-
   _spRenderQueue() {
     const panel = this.shadowRoot && this.shadowRoot.getElementById('np-queue');
     if (!panel) return;
-    if (!this._spQueueOpen) { panel.innerHTML = ''; return; }
     const items = this._spPlaylist || [];
     const rows = items.length ? items.map((it, idx) => `
       <div class="npq-row">
@@ -1337,7 +1336,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       this._spPlaylist = (await r.json()).items || [];
     } catch(e) {}
     this._spRefreshAddButtons();
-    if (this._spQueueOpen) this._spRenderQueue();
+    this._spRenderQueue();
   }
 
   async _spRemoveFromPlaylist(uri) {
@@ -1783,6 +1782,37 @@ class SoundcorkPresetEditor extends HTMLElement {
       }
       return;
     }
+    if (this._mode === "nowplaying") {
+      const speakerNames = this._getSpeakerNames();
+      const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
+      const chipsHtml = '<div class="spk-chips"><span class="spk-chip spk-chip-all ' + (allSelected?'active':'') + '" data-spk="all">All</span>' +
+        speakerNames.map(s => '<span class="spk-chip ' + (!allSelected && this._selectedSpeakers.includes(s.id)?'active':'') + '" data-spk="' + s.id + '">' + s.name + '</span>').join('') + '</div>';
+      const statusHtml = this._podcastStatus ? `<div class="podcast-status ${this._podcastStatus.type}">${this._podcastStatus.msg}</div>` : '';
+      this.shadowRoot.innerHTML = `<style>${this._styles()}</style><ha-card><div class="podcast-card">
+        <h3>Now Playing</h3>
+        ${chipsHtml}
+        ${statusHtml}
+        <div id="sp-now"></div>
+        <div class="np-queue" id="np-queue"></div>
+      </div></ha-card>`;
+      this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          const spk = chip.dataset.spk;
+          if (spk === 'all') { this._selectedSpeakers = null; }
+          else {
+            if (!this._selectedSpeakers) this._selectedSpeakers = [];
+            const idx = this._selectedSpeakers.indexOf(spk);
+            if (idx > -1) { this._selectedSpeakers.splice(idx, 1); if (!this._selectedSpeakers.length) this._selectedSpeakers = null; }
+            else { this._selectedSpeakers.push(spk); }
+          }
+          this._render();
+        });
+      });
+      this._spUpdateNowBar();
+      this._spRenderQueue();
+      this._spStartPolling();
+      return;
+    }
     if (this._mode === "spotify") {
       const speakerNames = this._getSpeakerNames();
       const allSelected = !this._selectedSpeakers || this._selectedSpeakers.length === 0;
@@ -1862,12 +1892,8 @@ class SoundcorkPresetEditor extends HTMLElement {
         <h3>Spotify-Podcasts</h3>
         ${chipsHtml}
         ${statusHtml}
-        <div id="sp-now"></div>
         ${bodyHtml}
       </div></ha-card>`;
-
-      this._spUpdateNowBar();
-      this._spStartPolling();
 
       this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
         chip.addEventListener('click', () => {
