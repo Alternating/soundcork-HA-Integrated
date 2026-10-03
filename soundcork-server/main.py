@@ -2971,25 +2971,39 @@ async def _queue_play_current() -> bool:
     _q["paused"] = False
     _q["started_at"] = asyncio.get_event_loop().time()
     provider = item.get("provider") or "spotify"
-    try:
-        if provider == "spotify":
-            await _spotify_connect_play(
-                item["uri"], [], item.get("title", ""), _q["master_ip"], _q["master_device_id"], _q["slaves"]
-            )
-            return True
-        async with _httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
-            stream = await _queue_resolve_stream(item, client)
+    # Resolve the MP3 stream once; retry only the speaker play step, since a
+    # /select timeout mid-transition is usually transient (speaker busy).
+    stream = ""
+    if provider != "spotify":
+        try:
+            async with _httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                stream = await _queue_resolve_stream(item, client)
+        except Exception as e:
+            logger.warning("queue: resolve failed for %s (%s): %s", item.get("title"), provider, e)
+            return False
         if not stream:
             logger.warning("queue: no stream for %s (%s) - skipping", item.get("title"), provider)
             return False
-        await _play_wrapped_stream(
-            stream, item.get("title", ""), item.get("image", ""),
-            _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
-        )
-        return True
-    except Exception as e:
-        logger.warning("queue: failed to play %s (%s): %s - skipping", item.get("title"), provider, e)
-        return False
+    last_err = None
+    for attempt in range(2):
+        try:
+            if provider == "spotify":
+                await _spotify_connect_play(
+                    item["uri"], [], item.get("title", ""), _q["master_ip"], _q["master_device_id"], _q["slaves"]
+                )
+            else:
+                await _play_wrapped_stream(
+                    stream, item.get("title", ""), item.get("image", ""),
+                    _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
+                )
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                await asyncio.sleep(2.0)  # let the speaker settle, then retry once
+    detail = getattr(last_err, "detail", None) or str(last_err) or type(last_err).__name__
+    logger.warning("queue: failed to play %s (%s): %s - skipping", item.get("title"), provider, detail)
+    return False
 
 
 async def _queue_play_from(index: int) -> bool:
