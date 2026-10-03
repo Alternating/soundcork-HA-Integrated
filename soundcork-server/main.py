@@ -3022,6 +3022,29 @@ async def _queue_item_finished(item: dict) -> bool:
         return False
 
 
+async def _queue_master_diverged(item: dict) -> bool:
+    """Has the user taken the master over with something that isn't our queue
+    item (e.g. started a radio preset)? If so the session must stand down
+    instead of fighting to resume/advance the podcast."""
+    if _q["paused"]:
+        return False
+    if asyncio.get_event_loop().time() - _q["started_at"] < _Q_START_GRACE:
+        return False
+    try:
+        async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+            txt = (await client.get(_speaker_url(_q["master_ip"], "/nowPlaying"))).text
+    except Exception:
+        return False
+    if (item.get("provider") or "spotify") == "spotify":
+        # our Spotify item plays on the SPOTIFY source; a preset switches source
+        return 'source="SPOTIFY"' not in txt and "STANDBY" not in txt
+    m = re.search(r"<itemName>([^<]*)</itemName>", txt)
+    name = (m.group(1) if m else "").strip()
+    title = (item.get("title") or "").strip()
+    # a different, non-empty itemName on the master = user started other content
+    return bool(name and title and name[:40] != title[:40])
+
+
 async def _queue_supervisor():
     try:
         while _q["active"]:
@@ -3029,6 +3052,10 @@ async def _queue_supervisor():
             if not _q["active"] or _q["paused"] or _q["current"] is None:
                 continue
             try:
+                if await _queue_master_diverged(_q["current"]):
+                    _q["active"] = False
+                    _q["current"] = None
+                    continue
                 done = await _queue_item_finished(_q["current"])
             except Exception:
                 done = False
@@ -3077,8 +3104,25 @@ async def api_queue_control(request: Request):
     """Transport for the active queue session. Body: {action: play|pause|
     next|previous|stop}."""
     action = ((await request.json()).get("action") or "").strip()
-    if not _q["active"] and action != "stop":
-        raise HTTPException(status_code=409, detail="no active queue session")
+    if not _q["active"]:
+        # No queue session: play/pause acts globally on whatever is actually
+        # playing (e.g. a radio preset) by toggling every playing speaker;
+        # next/previous/stop are queue-only and no-op here.
+        if action in ("play", "pause"):
+            async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                for s in _speakers_from_file():
+                    ip = s.get("ipAddress")
+                    if not ip:
+                        continue
+                    try:
+                        np = await client.get(_speaker_url(ip, "/nowPlaying"))
+                        playing = "PLAY_STATE" in np.text
+                        if (action == "pause" and playing) or (action == "play" and not playing and "STANDBY" not in np.text):
+                            await _key_press(client, ip, "PLAY_PAUSE")
+                    except Exception:
+                        pass
+            return {"success": True, "action": action, "external": True}
+        return {"success": True, "action": action, "note": "no active queue session"}
     cur = _q["current"] or {}
     provider = cur.get("provider") or "spotify"
     async with _q_lock:
@@ -3118,31 +3162,71 @@ async def _queue_pause_resume(provider, pause: bool):
         pass
 
 
+def _np_tag(txt: str, tag: str) -> str:
+    m = re.search(rf"<{tag}[^>]*>([^<]*)</{tag}>", txt)
+    return (m.group(1).strip() if m else "")
+
+
+async def _ambient_now_playing() -> dict | None:
+    """What's actually playing on the house, independent of the queue player,
+    so the global card reflects reality (e.g. a radio preset) rather than a
+    stale queue item. Returns the first speaker found in PLAY_STATE."""
+    for s in _speakers_from_file():
+        ip = s.get("ipAddress")
+        if not ip:
+            continue
+        try:
+            async with _httpx.AsyncClient(timeout=3.0) as client:
+                txt = (await client.get(_speaker_url(ip, "/nowPlaying"))).text
+        except Exception:
+            continue
+        if "PLAY_STATE" not in txt or "STANDBY" in txt:
+            continue
+        title = _np_tag(txt, "track") or _np_tag(txt, "itemName") or _np_tag(txt, "stationName")
+        return {
+            "title": title,
+            "artist": _np_tag(txt, "artist") or _np_tag(txt, "stationName"),
+            "image": _np_tag(txt, "art") or _np_tag(txt, "containerArt"),
+            "speaker": s.get("name", ""),
+        }
+    return None
+
+
 @app.get("/api/v1/queue/state", tags=["soundcork-api"])
 async def api_queue_state():
-    """Current queue-player state for the global Now Playing card. Position
-    (seek) is Spotify-only; MP3 providers report position_ms=null."""
+    """Global Now Playing state. When the queue player is active it reports the
+    queue item (with Spotify position for the seek bar). When it's idle it
+    falls back to whatever is actually playing on the speakers (external=true,
+    no queue transport) so the global card is never stale."""
     cur = _q["current"]
-    position_ms = None
-    if _q["active"] and cur and (cur.get("provider") or "spotify") == "spotify":
-        try:
-            token = await _spotify_token_or_503()
-            async with _httpx.AsyncClient(timeout=6.0) as client:
-                r = await client.get(f"{_SPOTIFY_API}/me/player", params={"additional_types": "episode"},
-                                     headers={"Authorization": f"Bearer {token}"})
-            if r.status_code == 200 and r.content:
-                position_ms = r.json().get("progress_ms")
-        except Exception:
-            pass
-    return {
-        "active": _q["active"],
-        "paused": _q["paused"],
-        "index": _q["index"],
-        "count": len(_q["items"]),
-        "current": cur,
-        "position_ms": position_ms,
-        "playing": _q["active"] and not _q["paused"],
-    }
+    if _q["active"] and cur:
+        position_ms = None
+        if (cur.get("provider") or "spotify") == "spotify":
+            try:
+                token = await _spotify_token_or_503()
+                async with _httpx.AsyncClient(timeout=6.0) as client:
+                    r = await client.get(f"{_SPOTIFY_API}/me/player", params={"additional_types": "episode"},
+                                         headers={"Authorization": f"Bearer {token}"})
+                if r.status_code == 200 and r.content:
+                    position_ms = r.json().get("progress_ms")
+            except Exception:
+                pass
+        return {
+            "active": True, "external": False, "paused": _q["paused"],
+            "index": _q["index"], "count": len(_q["items"]), "current": cur,
+            "position_ms": position_ms, "playing": not _q["paused"],
+        }
+    amb = await _ambient_now_playing()
+    if amb and (amb["title"] or amb["image"]):
+        return {
+            "active": False, "external": True, "paused": False,
+            "index": 0, "count": 0,
+            "current": {"provider": None, "uri": "", "title": amb["title"], "artist": amb["artist"],
+                        "image": amb["image"], "duration_ms": 0},
+            "position_ms": None, "playing": True,
+        }
+    return {"active": False, "external": False, "paused": False, "index": 0, "count": 0,
+            "current": None, "position_ms": None, "playing": False}
 
 
 # ---------------------------------------------------------------------------

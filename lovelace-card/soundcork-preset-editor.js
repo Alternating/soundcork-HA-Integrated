@@ -1282,6 +1282,11 @@ class SoundcorkPresetEditor extends HTMLElement {
       wrap.querySelector('#np-total').textContent = dur ? this._fmtClock(dur) : '';
     }
     wrap.querySelector('#np-playpause').innerHTML = n.playing ? '&#x23F8;' : '&#x25B6;';
+    // next/previous only make sense inside a queue session; hide them when
+    // the global bar is reflecting external playback (e.g. a radio preset)
+    const prevB = wrap.querySelector('#np-prev'), nextB = wrap.querySelector('#np-next');
+    if (prevB) prevB.style.display = n.external ? 'none' : '';
+    if (nextB) nextB.style.display = n.external ? 'none' : '';
   }
 
   _spRenderQueue() {
@@ -1342,15 +1347,16 @@ class SoundcorkPresetEditor extends HTMLElement {
   // map unified /queue/state to the now-bar's shape
   _mapQueueState(st) {
     const cur = (st && st.current) || null;
-    if (!st || !st.active || !cur) return { playing: false };
+    if (!cur) return { playing: false };   // nothing playing anywhere
     return {
       playing: !!st.playing,
-      progress_ms: st.position_ms,          // null for MP3 providers
+      progress_ms: st.position_ms,          // null for MP3 / external
       duration_ms: cur.duration_ms || 0,
       title: cur.title || '',
       artist: cur.artist || '',
       image: cur.image || '',
       has_seek: st.position_ms != null,     // only Spotify exposes a position
+      external: !!st.external,              // playing outside the queue (e.g. a preset)
     };
   }
 
