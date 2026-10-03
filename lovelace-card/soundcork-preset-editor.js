@@ -56,6 +56,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._spEpisodes = [];
     this._spLoading = false;
     this._spSelected = []; // episode URIs in checked order (series play)
+    this._spQueueOpen = false;
+    this._spQueue = null;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -675,6 +677,19 @@ class SoundcorkPresetEditor extends HTMLElement {
     .np-btn{background:none;border:none;cursor:pointer;color:var(--primary-text-color);font-size:20px;padding:4px 8px;border-radius:6px;transition:color .15s,background .15s}
     .np-btn:hover{color:var(--primary-color)}
     .np-play{font-size:26px}
+    .np-queue-btn{font-size:16px}
+    .np-queue-btn.active{color:var(--primary-color)}
+    .np-queue{margin-top:10px}
+    .np-queue:empty{margin-top:0}
+    .npq-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--secondary-text-color);padding:6px 0 4px;border-top:1px solid var(--divider-color,#444)}
+    .npq-list{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
+    .npq-row{display:flex;align-items:center;gap:8px;padding:4px 0}
+    .npq-art{width:32px;height:32px;border-radius:4px;overflow:hidden;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;font-size:14px}
+    .npq-art img{width:100%;height:100%;object-fit:cover}
+    .npq-info{flex:1;min-width:0}
+    .npq-title{font-size:12px;color:var(--primary-text-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .npq-sub{font-size:10px;color:var(--secondary-text-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .npq-note{font-size:10px;color:var(--secondary-text-color);margin-top:8px;line-height:1.4;font-style:italic}
     .fav-del:hover{color:#ff6b6b}
     .pod-adv{margin-top:12px}
     .pod-adv summary{font-size:11px;color:var(--secondary-text-color);cursor:pointer;margin-bottom:8px}
@@ -1215,11 +1230,14 @@ class SoundcorkPresetEditor extends HTMLElement {
             '<button class="np-btn" id="np-prev" title="Previous">&#x23EE;</button>' +
             '<button class="np-btn np-play" id="np-playpause" title="Play/Pause"></button>' +
             '<button class="np-btn" id="np-next" title="Next">&#x23ED;</button>' +
+            '<button class="np-btn np-queue-btn" id="np-queue-btn" title="Queue">&#x2630;</button>' +
           '</div>' +
+          '<div class="np-queue" id="np-queue"></div>' +
         '</div>';
       wrap.querySelector('#np-prev').addEventListener('click', () => this._spControl('previous'));
       wrap.querySelector('#np-next').addEventListener('click', () => this._spControl('next'));
       wrap.querySelector('#np-playpause').addEventListener('click', () => this._spControl(this._spNow && this._spNow.playing ? 'pause' : 'play'));
+      wrap.querySelector('#np-queue-btn').addEventListener('click', () => this._spToggleQueue());
       wrap.querySelector('#np-seek').addEventListener('click', (e) => {
         const d = this._spNow && this._spNow.duration_ms; if (!d) return;
         const rect = e.currentTarget.getBoundingClientRect();
@@ -1227,6 +1245,9 @@ class SoundcorkPresetEditor extends HTMLElement {
         this._spControl('seek', Math.round(frac * d));
       });
     }
+    const qbtn = wrap.querySelector('#np-queue-btn');
+    if (qbtn) qbtn.classList.toggle('active', !!this._spQueueOpen);
+    if (build && this._spQueueOpen) this._spRenderQueue();
     wrap.querySelector('#np-art').innerHTML = n.image ? `<img src="${this._esc(n.image)}" alt=""/>` : '&#x1F3A7;';
     wrap.querySelector('#np-title').textContent = n.title;
     wrap.querySelector('#np-artist').textContent = n.artist || '';
@@ -1234,6 +1255,54 @@ class SoundcorkPresetEditor extends HTMLElement {
     wrap.querySelector('#np-elapsed').textContent = this._fmtClock(pos);
     wrap.querySelector('#np-total').textContent = dur ? this._fmtClock(dur) : '';
     wrap.querySelector('#np-playpause').innerHTML = n.playing ? '&#x23F8;' : '&#x25B6;';
+  }
+
+  async _spToggleQueue() {
+    this._spQueueOpen = !this._spQueueOpen;
+    if (this._spQueueOpen) await this._spLoadQueue();
+    this._spRenderQueue();
+    const qbtn = this.shadowRoot && this.shadowRoot.querySelector('#np-queue-btn');
+    if (qbtn) qbtn.classList.toggle('active', this._spQueueOpen);
+  }
+
+  async _spLoadQueue() {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/queue`, {signal: AbortSignal.timeout(8000)});
+      this._spQueue = await r.json();
+    } catch(e) { this._spQueue = {current:null, queue:[]}; }
+  }
+
+  _spRenderQueue() {
+    const panel = this.shadowRoot && this.shadowRoot.getElementById('np-queue');
+    if (!panel) return;
+    if (!this._spQueueOpen) { panel.innerHTML = ''; return; }
+    const q = this._spQueue || {queue:[]};
+    const up = q.queue || [];
+    const rows = up.length ? up.map(it => `
+      <div class="npq-row">
+        <div class="npq-art">${it.image?`<img src="${this._esc(it.image)}" alt=""/>`:'&#x1F3A7;'}</div>
+        <div class="npq-info"><div class="npq-title">${this._esc(it.title)}</div><div class="npq-sub">${this._esc(it.artist)}${this._fmtDuration(Math.round((it.duration_ms||0)/1000))?' &middot; '+this._fmtDuration(Math.round((it.duration_ms||0)/1000)):''}</div></div>
+      </div>`).join('') : '<div class="empty" style="padding:8px 0">Nothing queued</div>';
+    panel.innerHTML =
+      '<div class="npq-head"><span>Up next</span>' +
+      (up.length ? '<button class="play-btn npq-clear">Clear upcoming</button>' : '') + '</div>' +
+      `<div class="npq-list">${rows}</div>` +
+      '<div class="npq-note">Spotify keeps its own suggestions in a show’s queue; Clear cancels the episodes you queued.</div>';
+    const cb = panel.querySelector('.npq-clear');
+    if (cb) cb.addEventListener('click', () => this._spClearQueue());
+  }
+
+  async _spClearQueue() {
+    const panel = this.shadowRoot && this.shadowRoot.getElementById('np-queue');
+    if (panel) { const c = panel.querySelector('.npq-clear'); if (c) { c.textContent = 'Clearing...'; c.disabled = true; } }
+    try {
+      await fetch(`${this._baseUrl}/api/v1/spotify/control`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'clear'})
+      });
+    } catch(e) {}
+    setTimeout(async () => { await this._spLoadQueue(); this._spRenderQueue();
+      try { const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal:AbortSignal.timeout(6000)}); this._spNow = await r.json(); this._spNowAt = Date.now(); this._spUpdateNowBar(); } catch(e) {}
+    }, 1200);
   }
 
   async _spControl(action, positionMs) {

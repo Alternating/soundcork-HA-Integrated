@@ -3685,10 +3685,64 @@ async def api_spotify_playback():
     }
 
 
+def _spotify_queue_item(item: dict) -> dict:
+    is_ep = item.get("type") == "episode"
+    if is_ep:
+        artist = (item.get("show") or {}).get("name", "")
+        images = (item.get("images") or []) or ((item.get("show") or {}).get("images") or [])
+    else:
+        artist = ", ".join(a.get("name", "") for a in (item.get("artists") or []))
+        images = (item.get("album") or {}).get("images") or []
+    return {
+        "uri": item.get("uri", ""),
+        "title": item.get("name", ""),
+        "artist": artist,
+        "image": _spotify_image(images),
+        "duration_ms": item.get("duration_ms") or 0,
+        "is_podcast": is_ep,
+    }
+
+
+@app.get("/api/v1/spotify/queue", tags=["soundcork-api"])
+async def api_spotify_queue():
+    """What's playing now and what's queued next, for the Queue panel.
+
+    Returns {current: {...}|null, queue: [{...}]}. Note Spotify always keeps
+    autoplay recommendations in a podcast's queue, so this is never truly
+    empty while a show is playing.
+    """
+    token = await _spotify_token_or_503()
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{_SPOTIFY_API}/me/player/queue",
+                params={"additional_types": "episode"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify queue failed: {e}")
+    if r.status_code == 204 or not r.content:
+        return {"current": None, "queue": []}
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Spotify queue error: {r.text[:200]}")
+    d = r.json()
+    cur = d.get("currently_playing")
+    return {
+        "current": _spotify_queue_item(cur) if cur else None,
+        "queue": [_spotify_queue_item(i) for i in (d.get("queue") or []) if i],
+    }
+
+
 @app.post("/api/v1/spotify/control", tags=["soundcork-api"])
 async def api_spotify_control(request: Request):
-    """Transport control. Body: {action: play|pause|next|previous|seek,
-    position_ms?} acting on the account's active Connect device."""
+    """Transport control. Body: {action: play|pause|next|previous|seek|clear,
+    position_ms?} acting on the account's active Connect device.
+
+    `clear` cancels a queued series by replaying just the current item at its
+    current position (Spotify has no remove-from-queue API). Spotify will
+    still autoplay the show's other episodes after it -- it clears what WE
+    queued, not Spotify's own recommendations.
+    """
     body = await request.json()
     action = (body.get("action") or "").strip()
     token = await _spotify_token_or_503()
@@ -3710,8 +3764,35 @@ async def api_spotify_control(request: Request):
                 r = await client.put(
                     f"{_SPOTIFY_API}/me/player/seek", params={"position_ms": pos}, headers=headers
                 )
+            elif action == "clear":
+                pb = await client.get(
+                    f"{_SPOTIFY_API}/me/player",
+                    params={"additional_types": "episode"},
+                    headers=headers,
+                )
+                if pb.status_code != 200 or not pb.content:
+                    return {"success": True, "action": action, "note": "nothing playing"}
+                pbd = pb.json()
+                item = pbd.get("item") or {}
+                cur_uri = item.get("uri")
+                if not cur_uri:
+                    return {"success": True, "action": action, "note": "nothing playing"}
+                params = {}
+                dev = (pbd.get("device") or {}).get("id")
+                if dev:
+                    params["device_id"] = dev
+                r = await client.put(
+                    f"{_SPOTIFY_API}/me/player/play",
+                    params=params,
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={"uris": [cur_uri], "position_ms": pbd.get("progress_ms", 0)},
+                )
+                if r.status_code in (200, 202, 204) and not pbd.get("is_playing"):
+                    await client.put(f"{_SPOTIFY_API}/me/player/pause", headers=headers)
             else:
-                raise HTTPException(status_code=400, detail="action must be play|pause|next|previous|seek")
+                raise HTTPException(
+                    status_code=400, detail="action must be play|pause|next|previous|seek|clear"
+                )
     except HTTPException:
         raise
     except Exception as e:
