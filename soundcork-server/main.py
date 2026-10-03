@@ -2958,29 +2958,55 @@ async def _queue_resolve_stream(item: dict, client: "_httpx.AsyncClient") -> str
     return ""
 
 
-async def _queue_play_current():
+async def _queue_play_current() -> bool:
     """Play the item at _q['index'] on the session's speakers (dispatch by
-    provider). Sets started_at/current. Zones slaves on every item so the
-    group follows across source switches."""
+    provider). Returns True if it started, False if the item couldn't be
+    played (resolve failed, speaker timeout, etc.) -- NEVER raises, so a bad
+    item can be skipped instead of crashing the supervisor / hanging the queue.
+    Zones slaves on every item so the group follows across source switches."""
     if not (0 <= _q["index"] < len(_q["items"])):
-        return
+        return False
     item = _q["items"][_q["index"]]
     _q["current"] = item
     _q["paused"] = False
     _q["started_at"] = asyncio.get_event_loop().time()
     provider = item.get("provider") or "spotify"
-    if provider == "spotify":
-        await _spotify_connect_play(
-            item["uri"], [], item.get("title", ""), _q["master_ip"], _q["master_device_id"], _q["slaves"]
-        )
-    else:
+    try:
+        if provider == "spotify":
+            await _spotify_connect_play(
+                item["uri"], [], item.get("title", ""), _q["master_ip"], _q["master_device_id"], _q["slaves"]
+            )
+            return True
         async with _httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
             stream = await _queue_resolve_stream(item, client)
-        if stream:
-            await _play_wrapped_stream(
-                stream, item.get("title", ""), item.get("image", ""),
-                _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
-            )
+        if not stream:
+            logger.warning("queue: no stream for %s (%s) - skipping", item.get("title"), provider)
+            return False
+        await _play_wrapped_stream(
+            stream, item.get("title", ""), item.get("image", ""),
+            _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
+        )
+        return True
+    except Exception as e:
+        logger.warning("queue: failed to play %s (%s): %s - skipping", item.get("title"), provider, e)
+        return False
+
+
+async def _queue_play_from(index: int) -> bool:
+    """Play from `index`, skipping forward over any item that fails to start,
+    so one bad episode (dead stream, speaker hiccup) never hangs the queue.
+    Deactivates the session when nothing playable remains."""
+    n = len(_q["items"])
+    _q["index"] = index
+    tried = 0
+    while 0 <= _q["index"] < n and tried < n:
+        if await _queue_play_current():
+            return True
+        _q["index"] += 1
+        tried += 1
+    _q["active"] = False
+    _q["current"] = None
+    return False
 
 
 async def _queue_item_finished(item: dict) -> bool:
@@ -3045,25 +3071,24 @@ async def _queue_supervisor():
     try:
         while _q["active"]:
             await asyncio.sleep(4.0)
-            if not _q["active"] or _q["paused"] or _q["current"] is None:
-                continue
             try:
+                if not _q["active"] or _q["paused"] or _q["current"] is None:
+                    continue
                 if await _queue_master_diverged(_q["current"]):
                     _q["active"] = False
                     _q["current"] = None
                     continue
-                done = await _queue_item_finished(_q["current"])
-            except Exception:
-                done = False
-            if not done:
-                continue
-            async with _q_lock:
-                if _q["index"] + 1 < len(_q["items"]):
-                    _q["index"] += 1
-                    await _queue_play_current()
-                else:
-                    _q["active"] = False
-                    _q["current"] = None
+                if not await _queue_item_finished(_q["current"]):
+                    continue
+                async with _q_lock:
+                    if _q["index"] + 1 < len(_q["items"]):
+                        await _queue_play_from(_q["index"] + 1)
+                    else:
+                        _q["active"] = False
+                        _q["current"] = None
+            except Exception as e:
+                # never let a single tick kill the supervisor (that was the hang)
+                logger.warning("queue supervisor tick error: %s", e)
     finally:
         _q["supervisor"] = None
 
@@ -3090,7 +3115,7 @@ async def api_queue_play(request: Request):
             master_ip=body.get("master_ip", ""), master_device_id=body.get("master_device_id", ""),
             slaves=body.get("slaves", []),
         )
-        await _queue_play_current()
+        await _queue_play_from(idx)
     _queue_ensure_supervisor()
     return {"success": True, "playing_index": idx, "count": len(items)}
 
@@ -3130,11 +3155,9 @@ async def api_queue_control(request: Request):
             await _queue_pause_resume(provider, pause=False)
         elif action == "next":
             if _q["index"] + 1 < len(_q["items"]):
-                _q["index"] += 1
-                await _queue_play_current()
+                await _queue_play_from(_q["index"] + 1)
         elif action == "previous":
-            _q["index"] = max(0, _q["index"] - 1)
-            await _queue_play_current()
+            await _queue_play_from(max(0, _q["index"] - 1))
         elif action == "stop":
             _q["active"] = False
             _q["current"] = None
