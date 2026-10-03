@@ -3233,6 +3233,40 @@ async def api_iheart_episode_stream(id: str):
 _SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 _SPOTIFY_API = "https://api.spotify.com/v1"
 _SPOTIFY_MARKET = "US"
+
+# Spotify's authorize endpoint rejects plain-HTTP redirect URIs on LAN
+# addresses at runtime ("redirect_uri: Insecure", observed 2026-10-03)
+# even though the developer dashboard accepts registering them. HTTP IS
+# still allowed for loopback, so account linking goes through a
+# 127.0.0.1 redirect URI (registered in the app alongside the LAN one):
+# the browser lands on a dead 127.0.0.1 page whose URL carries ?code=,
+# and /link/complete exchanges that code server-side with the matching
+# redirect_uri (both OAuth legs must use the same one).
+_SPOTIFY_LOOPBACK_REDIRECT = "http://127.0.0.1:8000/mgmt/spotify/callback"
+
+
+@app.get("/api/v1/spotify/link", include_in_schema=False)
+async def api_spotify_link():
+    """Start OAuth account linking. Open in a browser logged into the
+    (Premium) Spotify account; survives Spotify's HTTPS-or-loopback rule."""
+    from soundcork.mgmt import spotify as _spotify_svc
+
+    if not settings.spotify_client_id:
+        raise HTTPException(status_code=503, detail="SPOTIFY_CLIENT_ID not configured")
+    return RedirectResponse(url=_spotify_svc.build_authorize_url(redirect_uri=_SPOTIFY_LOOPBACK_REDIRECT))
+
+
+@app.get("/api/v1/spotify/link/complete", tags=["soundcork-api"])
+async def api_spotify_link_complete(code: str):
+    """Finish linking with the ?code= value from the 127.0.0.1 page the
+    browser lands on after the user approves."""
+    from soundcork.mgmt import spotify as _spotify_svc
+
+    try:
+        account = await _spotify_svc.exchange_code_and_store(code, redirect_uri=_SPOTIFY_LOOPBACK_REDIRECT)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify code exchange failed: {e}")
+    return {"linked": True, "account": account}
 _SPOTIFY_URI_RE = r"spotify:(track|album|playlist|artist|show|episode):[A-Za-z0-9]{22}"
 
 _spotify_cc_token = {"token": None, "expires_at": 0.0}
