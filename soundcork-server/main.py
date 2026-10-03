@@ -3418,7 +3418,10 @@ async def api_spotify_search(q: str, type: str = "show"):
         async with _httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(
                 f"{_SPOTIFY_API}/search",
-                params={"q": q.strip(), "type": "show", "limit": 20, "market": _SPOTIFY_MARKET},
+                # limit must be <=10: Spotify 400s "Invalid limit" above that
+                # for /v1/search on new apps (observed 2026-10-03; the
+                # /shows/{id}/episodes endpoint still accepts 50)
+                params={"q": q.strip(), "type": "show", "limit": 10, "market": _SPOTIFY_MARKET},
                 headers={"Authorization": f"Bearer {token}"},
             )
     except Exception as e:
