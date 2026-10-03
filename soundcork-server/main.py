@@ -2915,6 +2915,237 @@ async def api_play_stream(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Unified cross-provider queue + server-side auto-advance player.
+#
+# The queue (spotify_playlist.json) holds provider-tagged items. One active
+# player session plays them in order on the selected speakers, advancing when
+# each item finishes. MP3 providers (tunein/pushkin/iheart) play via the orion
+# wrap and are supervised by polling the master's nowPlaying; Spotify items
+# play via Connect and are supervised by polling /me/player. A background
+# supervisor task ticks every few seconds and auto-advances on natural end,
+# distinguishing end from a user pause via the session's own paused flag.
+# ---------------------------------------------------------------------------
+
+_q = {
+    "active": False,
+    "paused": False,
+    "index": 0,
+    "items": [],
+    "master_ip": "",
+    "master_device_id": "",
+    "slaves": [],
+    "started_at": 0.0,
+    "current": None,
+    "supervisor": None,
+}
+_q_lock = asyncio.Lock()
+_Q_START_GRACE = 8.0  # seconds after starting an item before end-detection runs
+
+
+async def _queue_resolve_stream(item: dict, client: "_httpx.AsyncClient") -> str:
+    """MP3 providers -> a playable stream URL. Spotify returns ''."""
+    provider = item.get("provider") or "spotify"
+    if provider == "tunein":
+        url, _ = await _resolve_tunein_stream(item["uri"])
+        return url
+    if provider == "pushkin":
+        return item.get("stream_url") or item.get("uri") or ""
+    if provider == "iheart":
+        r = await client.get(f"{_IHEART_API}/podcast/episodes/{item['uri']}")
+        if r.status_code == 200:
+            return ((r.json().get("episode") or {}).get("mediaUrl") or "").strip()
+        return ""
+    return ""
+
+
+async def _queue_play_current():
+    """Play the item at _q['index'] on the session's speakers (dispatch by
+    provider). Sets started_at/current. Zones slaves on every item so the
+    group follows across source switches."""
+    if not (0 <= _q["index"] < len(_q["items"])):
+        return
+    item = _q["items"][_q["index"]]
+    _q["current"] = item
+    _q["paused"] = False
+    _q["started_at"] = asyncio.get_event_loop().time()
+    provider = item.get("provider") or "spotify"
+    if provider == "spotify":
+        await _spotify_connect_play(
+            item["uri"], [], item.get("title", ""), _q["master_ip"], _q["master_device_id"], _q["slaves"]
+        )
+    else:
+        async with _httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            stream = await _queue_resolve_stream(item, client)
+        if stream:
+            await _play_wrapped_stream(
+                stream, item.get("title", ""), item.get("image", ""),
+                _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
+            )
+
+
+async def _queue_item_finished(item: dict) -> bool:
+    """Has the current item finished playing (natural end, not a user pause)?"""
+    if _q["paused"]:
+        return False
+    if asyncio.get_event_loop().time() - _q["started_at"] < _Q_START_GRACE:
+        return False  # still starting up / buffering
+    dur = item.get("duration_ms") or 0
+    try:
+        if (item.get("provider") or "spotify") == "spotify":
+            token = await _spotify_token_or_503()
+            async with _httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(
+                    f"{_SPOTIFY_API}/me/player", params={"additional_types": "episode"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if r.status_code == 204 or not r.content:
+                return True  # nothing playing -> ended
+            d = r.json()
+            cur = (d.get("item") or {}).get("uri")
+            if cur and cur != item["uri"]:
+                return True  # Spotify moved off our item (autoplay) -> advance to OUR next
+            prog = d.get("progress_ms") or 0
+            if not d.get("is_playing") and dur and prog >= dur - 4000:
+                return True
+            return False
+        else:
+            async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                np = await client.get(_speaker_url(_q["master_ip"], "/nowPlaying"))
+            txt = np.text
+            if "PLAY_STATE" not in txt and "BUFFERING_STATE" not in txt:
+                return True  # stopped and we didn't pause -> ended
+            # duration backstop (no position feedback for LOCAL_INTERNET_RADIO)
+            if dur and (asyncio.get_event_loop().time() - _q["started_at"]) * 1000 >= dur + 15000:
+                return True
+            return False
+    except Exception:
+        return False
+
+
+async def _queue_supervisor():
+    try:
+        while _q["active"]:
+            await asyncio.sleep(4.0)
+            if not _q["active"] or _q["paused"] or _q["current"] is None:
+                continue
+            try:
+                done = await _queue_item_finished(_q["current"])
+            except Exception:
+                done = False
+            if not done:
+                continue
+            async with _q_lock:
+                if _q["index"] + 1 < len(_q["items"]):
+                    _q["index"] += 1
+                    await _queue_play_current()
+                else:
+                    _q["active"] = False
+                    _q["current"] = None
+    finally:
+        _q["supervisor"] = None
+
+
+def _queue_ensure_supervisor():
+    if _q["supervisor"] is None or _q["supervisor"].done():
+        _q["supervisor"] = asyncio.ensure_future(_queue_supervisor())
+
+
+@app.post("/api/v1/queue/play", tags=["soundcork-api"])
+async def api_queue_play(request: Request):
+    """Start playing the queue on speakers. Body: {master_ip,
+    master_device_id, slaves, start_uri?}. Plays from start_uri if given,
+    else from the top, auto-advancing through the rest."""
+    body = await request.json()
+    items = _load_spotify_playlist()
+    if not items:
+        raise HTTPException(status_code=400, detail="queue is empty")
+    start = (body.get("start_uri") or "").strip()
+    idx = next((n for n, i in enumerate(items) if i.get("uri") == start), 0) if start else 0
+    async with _q_lock:
+        _q.update(
+            active=True, paused=False, index=idx, items=items,
+            master_ip=body.get("master_ip", ""), master_device_id=body.get("master_device_id", ""),
+            slaves=body.get("slaves", []),
+        )
+        await _queue_play_current()
+    _queue_ensure_supervisor()
+    return {"success": True, "playing_index": idx, "count": len(items)}
+
+
+@app.post("/api/v1/queue/control", tags=["soundcork-api"])
+async def api_queue_control(request: Request):
+    """Transport for the active queue session. Body: {action: play|pause|
+    next|previous|stop}."""
+    action = ((await request.json()).get("action") or "").strip()
+    if not _q["active"] and action != "stop":
+        raise HTTPException(status_code=409, detail="no active queue session")
+    cur = _q["current"] or {}
+    provider = cur.get("provider") or "spotify"
+    async with _q_lock:
+        if action == "pause":
+            _q["paused"] = True
+            await _queue_pause_resume(provider, pause=True)
+        elif action == "play":
+            _q["paused"] = False
+            await _queue_pause_resume(provider, pause=False)
+        elif action == "next":
+            if _q["index"] + 1 < len(_q["items"]):
+                _q["index"] += 1
+                await _queue_play_current()
+        elif action == "previous":
+            _q["index"] = max(0, _q["index"] - 1)
+            await _queue_play_current()
+        elif action == "stop":
+            _q["active"] = False
+            _q["current"] = None
+            await _queue_pause_resume(provider, pause=True)
+        else:
+            raise HTTPException(status_code=400, detail="action must be play|pause|next|previous|stop")
+    return {"success": True, "action": action, "index": _q["index"]}
+
+
+async def _queue_pause_resume(provider, pause: bool):
+    try:
+        if provider == "spotify":
+            token = await _spotify_token_or_503()
+            async with _httpx.AsyncClient(timeout=8.0) as client:
+                verb = "pause" if pause else "play"
+                await client.put(f"{_SPOTIFY_API}/me/player/{verb}", headers={"Authorization": f"Bearer {token}"})
+        elif provider:  # MP3 providers: PLAY_PAUSE toggles play<->stop
+            async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                await _key_press(client, _q["master_ip"], "PLAY_PAUSE")
+    except Exception:
+        pass
+
+
+@app.get("/api/v1/queue/state", tags=["soundcork-api"])
+async def api_queue_state():
+    """Current queue-player state for the global Now Playing card. Position
+    (seek) is Spotify-only; MP3 providers report position_ms=null."""
+    cur = _q["current"]
+    position_ms = None
+    if _q["active"] and cur and (cur.get("provider") or "spotify") == "spotify":
+        try:
+            token = await _spotify_token_or_503()
+            async with _httpx.AsyncClient(timeout=6.0) as client:
+                r = await client.get(f"{_SPOTIFY_API}/me/player", params={"additional_types": "episode"},
+                                     headers={"Authorization": f"Bearer {token}"})
+            if r.status_code == 200 and r.content:
+                position_ms = r.json().get("progress_ms")
+        except Exception:
+            pass
+    return {
+        "active": _q["active"],
+        "paused": _q["paused"],
+        "index": _q["index"],
+        "count": len(_q["items"]),
+        "current": cur,
+        "position_ms": position_ms,
+        "playing": _q["active"] and not _q["paused"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pushkin Industries (pushkin.fm)
 # Fixed curated catalog (~30 shows) scraped from pushkin.fm/podcasts; each
 # show page links its Omny RSS feed, whose enclosures are the same
@@ -3439,24 +3670,39 @@ async def api_spotify_playlist():
     return {"items": _load_spotify_playlist()}
 
 
+_QUEUE_PROVIDER_URI = {
+    "spotify": r"spotify:(episode|track):[A-Za-z0-9]+",
+    "tunein": r"t\d+",
+    "iheart": r"\d+",
+    "pushkin": r".{1,600}",  # the episode's audio_url (enclosure)
+}
+
+
 @app.post("/api/v1/spotify/playlist/add", tags=["soundcork-api"])
 async def api_spotify_playlist_add(request: Request):
-    """Append an episode/track. Body: {uri, title, artist?, image?,
-    duration_ms?}. No-op if the uri is already in the list."""
+    """Append an item to the unified queue. Body: {uri, title, artist?,
+    image?, duration_ms?, provider?, stream_url?}. provider defaults to
+    "spotify". uri is the provider's play id: spotify URI, tunein t-id,
+    iheart episode id, or pushkin audio_url. No-op if uri already queued."""
     body = await request.json()
+    provider = (body.get("provider") or "spotify").strip()
+    if provider not in _QUEUE_PROVIDER_URI:
+        raise HTTPException(status_code=400, detail=f"provider must be one of {sorted(_QUEUE_PROVIDER_URI)}")
     uri = (body.get("uri") or "").strip()
-    if not re.fullmatch(r"spotify:(episode|track):[A-Za-z0-9]+", uri):
-        raise HTTPException(status_code=400, detail="uri must be a spotify:episode: or spotify:track: URI")
+    if not re.fullmatch(_QUEUE_PROVIDER_URI[provider], uri):
+        raise HTTPException(status_code=400, detail=f"uri is not a valid {provider} id")
     async with _spotify_playlist_lock:
         items = _load_spotify_playlist()
         if not any(i.get("uri") == uri for i in items):
             items.append(
                 {
+                    "provider": provider,
                     "uri": uri,
                     "title": (body.get("title") or "").strip() or uri,
                     "artist": (body.get("artist") or "").strip(),
                     "image": (body.get("image") or "").strip(),
                     "duration_ms": body.get("duration_ms") or 0,
+                    "stream_url": (body.get("stream_url") or "").strip(),
                 }
             )
             _save_spotify_playlist(items)

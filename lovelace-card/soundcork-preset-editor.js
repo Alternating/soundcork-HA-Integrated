@@ -871,6 +871,18 @@ class SoundcorkPresetEditor extends HTMLElement {
     return m >= 60 ? `${Math.floor(m/60)}h ${m%60}m` : `${m}m`;
   }
 
+  // Add an item to the unified queue from any provider tile, updating the
+  // button in place (no re-render -> no scroll jump in the episode list).
+  async _queueAddInPlace(btn, payload) {
+    btn.disabled = true;
+    try {
+      await fetch(`${this._baseUrl}/api/v1/spotify/playlist/add`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)
+      });
+      btn.classList.add('added'); btn.innerHTML = '&#x2713;'; btn.title = 'Added to queue';
+    } catch(e) { btn.disabled = false; }
+  }
+
   async _playGuideId(guideId, title, image) {
     const targets = this._getTargetSpeakers();
     if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
@@ -1188,8 +1200,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     const tick = async () => {
       if (this._mode !== 'nowplaying' || !this.isConnected) { this._spStopPolling(); return; }
       try {
-        const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal: AbortSignal.timeout(6000)});
-        this._spNow = await r.json();
+        const r = await fetch(`${this._baseUrl}/api/v1/queue/state`, {signal: AbortSignal.timeout(6000)});
+        this._spNow = this._mapQueueState(await r.json());
         this._spNowAt = Date.now();
       } catch(e) { /* keep last state on a transient failure */ }
       // also resync the playlist so adds from the provider tiles show up here
@@ -1260,9 +1272,15 @@ class SoundcorkPresetEditor extends HTMLElement {
     wrap.querySelector('#np-art').innerHTML = n.image ? `<img src="${this._esc(n.image)}" alt=""/>` : '&#x1F3A7;';
     wrap.querySelector('#np-title').textContent = n.title;
     wrap.querySelector('#np-artist').textContent = n.artist || '';
-    wrap.querySelector('#np-seek-fill').style.width = pct + '%';
-    wrap.querySelector('#np-elapsed').textContent = this._fmtClock(pos);
-    wrap.querySelector('#np-total').textContent = dur ? this._fmtClock(dur) : '';
+    // seek bar only when the source reports a position (Spotify); MP3 has none
+    const hasSeek = n.has_seek !== false && n.progress_ms != null;
+    wrap.querySelector('#np-seek').style.display = hasSeek ? '' : 'none';
+    wrap.querySelector('.np-times').style.display = hasSeek ? '' : 'none';
+    if (hasSeek) {
+      wrap.querySelector('#np-seek-fill').style.width = pct + '%';
+      wrap.querySelector('#np-elapsed').textContent = this._fmtClock(pos);
+      wrap.querySelector('#np-total').textContent = dur ? this._fmtClock(dur) : '';
+    }
     wrap.querySelector('#np-playpause').innerHTML = n.playing ? '&#x23F8;' : '&#x25B6;';
   }
 
@@ -1296,19 +1314,44 @@ class SoundcorkPresetEditor extends HTMLElement {
       this._spUpdateNowBar();
     }
     try {
-      const body = { action };
-      if (action === 'seek') body.position_ms = positionMs;
-      await fetch(`${this._baseUrl}/api/v1/spotify/control`, {
-        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
-      });
+      if (action === 'seek') {
+        // seek is Spotify-only (MP3 sources have no scrub); hits the spotify API directly
+        await fetch(`${this._baseUrl}/api/v1/spotify/control`, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ action: 'seek', position_ms: positionMs })
+        });
+      } else {
+        // play/pause/next/previous go through the unified queue player
+        await fetch(`${this._baseUrl}/api/v1/queue/control`, {
+          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action })
+        });
+      }
     } catch(e) { /* next poll reconciles */ }
-    // re-sync shortly after (next/prev change the track)
-    setTimeout(async () => {
-      try {
-        const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal: AbortSignal.timeout(6000)});
-        this._spNow = await r.json(); this._spNowAt = Date.now(); this._spUpdateNowBar();
-      } catch(e) {}
-    }, action === 'seek' ? 400 : 700);
+    setTimeout(() => this._spRefreshNow(), action === 'seek' ? 400 : 1200);
+  }
+
+  async _spRefreshNow() {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/queue/state`, {signal: AbortSignal.timeout(6000)});
+      this._spNow = this._mapQueueState(await r.json());
+      this._spNowAt = Date.now();
+      this._spUpdateNowBar();
+    } catch(e) {}
+  }
+
+  // map unified /queue/state to the now-bar's shape
+  _mapQueueState(st) {
+    const cur = (st && st.current) || null;
+    if (!st || !st.active || !cur) return { playing: false };
+    return {
+      playing: !!st.playing,
+      progress_ms: st.position_ms,          // null for MP3 providers
+      duration_ms: cur.duration_ms || 0,
+      title: cur.title || '',
+      artist: cur.artist || '',
+      image: cur.image || '',
+      has_seek: st.position_ms != null,     // only Spotify exposes a position
+    };
   }
 
   disconnectedCallback() { this._spStopPolling(); }
@@ -1381,17 +1424,18 @@ class SoundcorkPresetEditor extends HTMLElement {
     const mi = this._pickMasterIdx(reachable);
     const master = reachable[mi], slaves = reachable.filter((_, i) => i !== mi);
     try {
-      const r = await fetch(`${this._baseUrl}/api/v1/spotify/playlist/play`, {
+      const r = await fetch(`${this._baseUrl}/api/v1/queue/play`, {
         method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ master_ip: master.ip, master_device_id: master.device_id, slaves })
       });
       const data = await r.json();
       this._podcastStatus = (r.ok && data.success)
-        ? {type:'success', msg:`Playing ${data.queued} from your playlist on ${data.speakers} speaker${data.speakers>1?'s':''}`}
+        ? {type:'success', msg:`Playing your queue (${data.count} item${data.count>1?'s':''})`}
         : {type:'error', msg: data.detail || 'Playback failed'};
     } catch(e) { this._podcastStatus = {type:'error', msg:'Network error - check SoundCork connection'}; }
     this._podcastLoading = false;
     this._render();
+    setTimeout(() => this._spRefreshNow(), 1500);
     setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
   }
 
@@ -1450,6 +1494,7 @@ class SoundcorkPresetEditor extends HTMLElement {
                 <div class="result-name">${this._esc(ep.title)}</div>
                 <div class="result-sub">${this._esc(ep.date)}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
               </div>
+              <button class="sp-add ti-ep-add" data-i="${i}" title="Add to queue">&#x2b;</button>
               <button class="play-btn ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
             </div>`).join('') : '<div class="empty">No episodes found</div>';
         bodyHtml = `
@@ -1552,6 +1597,10 @@ class SoundcorkPresetEditor extends HTMLElement {
       if (this._podcastView === 'episodes' && this._podcastShow) {
         this.shadowRoot.getElementById('pod-back')?.addEventListener('click', () => { this._podcastView = 'search'; this._podcastShow = null; this._render(); });
         this.shadowRoot.getElementById('pod-fav')?.addEventListener('click', () => this._toggleFavorite(this._podcastShow));
+        this.shadowRoot.querySelectorAll('.ti-ep-add').forEach(b => b.addEventListener('click', () => {
+          const ep = this._podcastEpisodes[parseInt(b.dataset.i)];
+          if (ep) this._queueAddInPlace(b, { provider:'tunein', uri: ep.guide_id, title: ep.title, artist: (this._podcastShow && this._podcastShow.name) || '', image: ep.image || (this._podcastShow && this._podcastShow.image) || '', duration_ms: (ep.duration_seconds||0)*1000 });
+        }));
         this.shadowRoot.querySelectorAll('.ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._podcastEpisodes[parseInt(b.dataset.i)];
           if (ep) this._playGuideId(ep.guide_id, ep.title, ep.image || this._podcastShow.image);
@@ -1602,6 +1651,7 @@ class SoundcorkPresetEditor extends HTMLElement {
                 <div class="result-name">${this._esc(ep.title)}</div>
                 <div class="result-sub">${this._esc((ep.date||'').replace(/\s*\d\d:\d\d:\d\d.*$/,''))}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
               </div>
+              <button class="sp-add pk-ep-add" data-i="${i}" title="Add to queue">&#x2b;</button>
               <button class="play-btn pk-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
             </div>`).join('') : '<div class="empty">No episodes found</div>';
         bodyHtml = `
@@ -1655,6 +1705,10 @@ class SoundcorkPresetEditor extends HTMLElement {
       if (this._pkView === 'episodes' && this._pkShow) {
         this.shadowRoot.getElementById('pk-back')?.addEventListener('click', () => { this._pkView = 'list'; this._pkShow = null; this._render(); });
         this.shadowRoot.getElementById('pk-fav')?.addEventListener('click', () => this._pkToggleFavorite(this._pkShow));
+        this.shadowRoot.querySelectorAll('.pk-ep-add').forEach(b => b.addEventListener('click', () => {
+          const ep = this._pkEpisodes[parseInt(b.dataset.i)];
+          if (ep) this._queueAddInPlace(b, { provider:'pushkin', uri: ep.audio_url, stream_url: ep.audio_url, title: ep.title, artist: (this._pkShow && this._pkShow.name) || '', image: ep.image || (this._pkShow && this._pkShow.image) || '', duration_ms: (ep.duration_seconds||0)*1000 });
+        }));
         this.shadowRoot.querySelectorAll('.pk-ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._pkEpisodes[parseInt(b.dataset.i)];
           if (ep) this._playStreamUrl(ep.audio_url, `${this._pkShow.name}: ${ep.title}`, ep.image || this._pkShow.image);
@@ -1695,6 +1749,7 @@ class SoundcorkPresetEditor extends HTMLElement {
                 <div class="result-name">${this._esc(ep.title)}</div>
                 <div class="result-sub">${this._esc(ep.date || '')}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
               </div>
+              <button class="sp-add ih-ep-add" data-i="${i}" title="Add to queue">&#x2b;</button>
               <button class="play-btn ih-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
             </div>`).join('') : '<div class="empty">No episodes found</div>';
         bodyHtml = `
@@ -1759,6 +1814,10 @@ class SoundcorkPresetEditor extends HTMLElement {
       if (this._ihView === 'episodes' && this._ihShow) {
         this.shadowRoot.getElementById('ih-back')?.addEventListener('click', () => { this._ihView = 'search'; this._ihShow = null; this._render(); });
         this.shadowRoot.getElementById('ih-fav')?.addEventListener('click', () => this._ihToggleFavorite(this._ihShow));
+        this.shadowRoot.querySelectorAll('.ih-ep-add').forEach(b => b.addEventListener('click', () => {
+          const ep = this._ihEpisodes[parseInt(b.dataset.i)];
+          if (ep) this._queueAddInPlace(b, { provider:'iheart', uri: String(ep.episode_id), title: ep.title, artist: (this._ihShow && this._ihShow.name) || '', image: ep.image || (this._ihShow && this._ihShow.image) || '', duration_ms: (ep.duration_seconds||0)*1000 });
+        }));
         this.shadowRoot.querySelectorAll('.ih-ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._ihEpisodes[parseInt(b.dataset.i)];
           if (ep) this._ihPlayEpisode(ep, this._ihShow.name, this._ihShow.image);
