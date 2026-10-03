@@ -613,6 +613,10 @@ class SoundcorkPresetEditor extends HTMLElement {
     .spk-track{font-size:12px;color:var(--secondary-text-color);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
     .spk-power{background:none;border:none;cursor:pointer;padding:6px;color:var(--secondary-text-color);font-size:22px;flex-shrink:0}
     .spk-power:hover{color:var(--primary-text-color)}
+    .spk-mute{background:none;border:none;cursor:pointer;padding:4px 6px;color:var(--secondary-text-color);font-size:17px;flex-shrink:0;transition:color .15s}
+    .spk-mute:hover{color:var(--primary-text-color)}
+    .spk-mute.muted{color:#ff6b6b}
+    .spk-mute:disabled{opacity:.4;cursor:not-allowed}
     .chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
     .chip{display:flex;align-items:center;gap:6px;padding:5px 10px 5px 6px;border-radius:20px;background:var(--secondary-background-color,#2a2a40);border:1.5px solid transparent;cursor:pointer;font-size:12px;color:var(--primary-text-color);transition:border-color .15s,background .15s}
     .chip img{width:20px;height:20px;border-radius:50%;object-fit:cover}
@@ -715,6 +719,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     const track = np && np.title ? np.title : (isOff ? "Off" : "--");
     const artist = np && np.artist ? np.artist : "";
     const volVal = vol ? vol.actual : 0;
+    const muted = vol ? !!vol.muted : false;
     const name = this._config.speaker_name || "Speaker";
     return `<div class="spk-card">
       <div class="spk-top">
@@ -729,6 +734,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         <span class="vol-label">&#x1F50A;</span>
         <input class="vol-slider" id="vol-slider" type="range" min="0" max="100" value="${volVal}" ${isOff ? "disabled" : ""}/>
         <span class="vol-val" id="vol-val">${volVal}%</span>
+        <button class="spk-mute ${muted ? "muted" : ""}" id="spk-mute" title="${muted ? "Unmute" : "Mute"}" ${isOff ? "disabled" : ""}>${muted ? "&#x1F507;" : "&#x1F50A;"}</button>
       </div>
     </div>`;
   }
@@ -2134,6 +2140,20 @@ class SoundcorkPresetEditor extends HTMLElement {
         const isOff = !np || !np.source || np.source === "STANDBY";
         const ip = this._getSpeakerIps()[0];
         if (ip) fetch(`${this._baseUrl}/api/v1/speakers/${ip}/power-${isOff ? "on" : "off"}`, {method:"POST"});
+      });
+      this.shadowRoot.getElementById("spk-mute")?.addEventListener("click", (e) => {
+        const ip = this._getSpeakerIps()[0];
+        if (!ip) return;
+        // MUTE is a toggle on the speaker; flip the button instantly and guard
+        // the re-render briefly so HA state lag doesn't revert the icon
+        const btn = e.currentTarget;
+        const willMute = !btn.classList.contains("muted");
+        btn.classList.toggle("muted", willMute);
+        btn.innerHTML = willMute ? "&#x1F507;" : "&#x1F50A;";
+        btn.title = willMute ? "Unmute" : "Mute";
+        this._volDragging = true;
+        fetch(`${this._baseUrl}/api/v1/speakers/${ip}/key/MUTE`, {method:"POST"}).catch(()=>{});
+        setTimeout(() => { this._volDragging = false; }, 1500);
       });
       return;
     }
