@@ -2984,25 +2984,49 @@ async def _queue_play_current() -> bool:
         if not stream:
             logger.warning("queue: no stream for %s (%s) - skipping", item.get("title"), provider)
             return False
+    title = item.get("title", "")
     last_err = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             if provider == "spotify":
                 await _spotify_connect_play(
-                    item["uri"], [], item.get("title", ""), _q["master_ip"], _q["master_device_id"], _q["slaves"]
+                    item["uri"], [], title, _q["master_ip"], _q["master_device_id"], _q["slaves"]
                 )
-            else:
-                await _play_wrapped_stream(
-                    stream, item.get("title", ""), item.get("image", ""),
-                    _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
-                )
-            return True
+                return True
+            await _play_wrapped_stream(
+                stream, title, item.get("image", ""),
+                _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
+            )
+            # Verify the master ACTUALLY switched to this item. The speaker
+            # silently ignores a /select while already streaming another
+            # LOCAL_INTERNET_RADIO, and _confirm_play_and_zone only checks for
+            # any PLAY_STATE, so without this a stuck old item reads as success.
+            if await _queue_mp3_switched(title):
+                return True
+            last_err = "master did not switch to this item"
         except Exception as e:
             last_err = e
-            if attempt == 0:
-                await asyncio.sleep(2.0)  # let the speaker settle, then retry once
+        if attempt < 2:
+            await asyncio.sleep(2.0)  # let the speaker settle, then re-select
     detail = getattr(last_err, "detail", None) or str(last_err) or type(last_err).__name__
-    logger.warning("queue: failed to play %s (%s): %s - skipping", item.get("title"), provider, detail)
+    logger.warning("queue: failed to play %s (%s): %s - skipping", title, provider, detail)
+    return False
+
+
+async def _queue_mp3_switched(title: str) -> bool:
+    """Poll the master until its itemName matches our orion item's title
+    (the speaker echoes our exact itemName for LOCAL_INTERNET_RADIO)."""
+    want = (title or "")[:30]
+    for _ in range(6):
+        try:
+            async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                txt = (await client.get(_speaker_url(_q["master_ip"], "/nowPlaying"))).text
+            m = re.search(r"<itemName>([^<]*)</itemName>", txt)
+            if m and m.group(1).strip()[:30] == want:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
     return False
 
 
