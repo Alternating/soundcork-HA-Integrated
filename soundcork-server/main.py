@@ -2790,6 +2790,33 @@ async def _select_confirm_zone(
     except _httpx.TimeoutException:
         raise HTTPException(status_code=504, detail=f"Speaker at {master_ip} timed out")
 
+    confirmed = await _confirm_play_and_zone(master_ip, master_device_id, slaves)
+
+    if slaves and not confirmed:
+        # Master never confirmed; play independently so audio still happens
+        for s in slaves:
+            try:
+                async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
+                    await client.post(
+                        _speaker_url(s["ip"], "/select"),
+                        content=content_item_xml.encode(),
+                        headers={"Content-Type": "application/xml"},
+                    )
+            except Exception:
+                pass
+
+    return confirmed
+
+
+async def _confirm_play_and_zone(master_ip: str, master_device_id: str, slaves: list) -> bool:
+    """Poll the master until PLAY/BUFFERING, then zone the slaves onto it.
+
+    Source-agnostic: the master's audio is already starting (via ContentItem
+    /select for orion/native tiles, or via a Spotify Connect transfer), and
+    this only confirms + groups. Returns whether the master confirmed;
+    zoning an unconfirmed master drops the group into INVALID_SOURCE, so
+    callers handle the unconfirmed case themselves.
+    """
     confirmed = False
     for _ in range(10):
         await asyncio.sleep(1.0)
@@ -2817,18 +2844,6 @@ async def _select_confirm_zone(
                 )
         except Exception:
             pass
-    elif slaves:
-        # Master never confirmed; play independently so audio still happens
-        for s in slaves:
-            try:
-                async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
-                    await client.post(
-                        _speaker_url(s["ip"], "/select"),
-                        content=content_item_xml.encode(),
-                        headers={"Content-Type": "application/xml"},
-                    )
-            except Exception:
-                pass
 
     return confirmed
 
@@ -3398,11 +3413,23 @@ async def api_spotify_status():
 
     configured      -- SPOTIFY_CLIENT_ID/SECRET env vars present (Web API
                        search works).
-    speaker_account -- SPOTIFY sourceAccount found in Sources.xml, else
-                       null (= no Spotify account linked on the speakers;
-                       /play will refuse with 409 until one is linked).
+    speaker_account -- the linked Spotify account id (from the OAuth
+                       account store), else null. Playback is via Spotify
+                       Connect after priming, so this tracks the linked
+                       account rather than a Sources.xml SPOTIFY source
+                       (Connect priming never writes one).
     """
-    return {"configured": _spotify_configured(), "speaker_account": _spotify_speaker_account()}
+    from soundcork.mgmt import spotify as _spotify_svc
+
+    account = None
+    try:
+        accounts = _spotify_svc.list_accounts()
+        if accounts:
+            a = accounts[0]
+            account = a.get("spotifyUserId") or a.get("id") if isinstance(a, dict) else str(a)
+    except Exception:
+        pass
+    return {"configured": _spotify_configured(), "speaker_account": account}
 
 
 @app.get("/api/v1/spotify/search", tags=["soundcork-api"])
@@ -3483,22 +3510,24 @@ async def api_spotify_episodes(id: str):
 
 @app.post("/api/v1/spotify/play", tags=["soundcork-api"])
 async def api_spotify_play(request: Request):
-    """Play a Spotify URI on speakers via the NATIVE SPOTIFY source.
+    """Play a Spotify URI on speakers via SPOTIFY CONNECT.
 
-    Body: {uri, title?, image?, source_account?, master_ip,
-           master_device_id, slaves: [{ip, device_id}]}
+    Body: {uri, title?, image?, master_ip, master_device_id,
+           slaves: [{ip, device_id}]}
 
-    Builds the ContentItem shape upstream's webui stores as working
-    presets (see section header for evidence):
-      source="SPOTIFY" type="tracklisturl"
-      location="/playback/container/{base64(uri)}"
-      sourceAccount={Spotify user id from Sources.xml}
-    then runs the shared select -> confirm PLAY_STATE -> zone pipeline.
+    Mechanism (verified on hardware 2026-10-03): after ZeroConf priming,
+    each speaker registers with Spotify's servers as a Connect device whose
+    name matches its SoundTouch name. The Bose /select ContentItem path for
+    SPOTIFY stays INVALID_SOURCE (the source sits UNAVAILABLE); the path
+    that works is a Spotify Web API playback transfer to the speaker's
+    Connect device id. Episode/track URIs go in `uris`, show/album/playlist/
+    artist contexts in `context_uri`. Slaves are then zoned onto the master
+    via Bose /setZone so the group mirrors the master's Spotify audio.
 
-    409s when no Spotify account is linked on the speakers (the firmware
-    rejects /select for sources it has no credentials for); the optional
-    source_account body field overrides discovery for hardware testing.
+    409s when no Spotify account is linked (nothing primed the speakers).
     """
+    from soundcork.mgmt import spotify as _spotify_svc
+
     body = await request.json()
     uri = (body.get("uri") or "").strip()
     master_ip = body.get("master_ip", "")
@@ -3510,35 +3539,64 @@ async def api_spotify_play(request: Request):
             status_code=400,
             detail="uri must look like spotify:show:... / spotify:episode:... (track, album, playlist, artist also accepted)",
         )
-    account = (body.get("source_account") or "").strip() or _spotify_speaker_account()
-    if not account:
+    if not _spotify_svc.list_accounts():
         raise HTTPException(
             status_code=409,
             detail=(
-                "No Spotify account is linked on the speakers (no SPOTIFY source in "
-                "Sources.xml). Link a Spotify Premium account via the SoundCork webui "
-                "(requires SPOTIFY_CLIENT_ID/SECRET) before native playback can work."
+                "No Spotify account is linked. Link a Spotify Premium account via the "
+                "SoundCork webui (requires SPOTIFY_CLIENT_ID/SECRET) before playback."
             ),
         )
 
-    title = (body.get("title") or "").strip() or uri
-    image = (body.get("image") or "").strip()
-    location = "/playback/container/" + _base64.b64encode(uri.encode()).decode()
-    xml = (
-        f'<ContentItem source="SPOTIFY" type="tracklisturl" '
-        f"location={_xml_quoteattr(location)} "
-        f"sourceAccount={_xml_quoteattr(account)} "
-        f'isPresetable="true">'
-        f"<itemName>{_xml_escape(title)}</itemName>"
-        f"<containerArt>{_xml_escape(image)}</containerArt>"
-        f"</ContentItem>"
+    # Resolve the master speaker's name so we can match its Connect device.
+    master_name = next(
+        (s.get("name") for s in _speakers_from_file() if s.get("ipAddress") == master_ip), None
     )
+    if not master_name:
+        raise HTTPException(status_code=404, detail=f"No speaker named for ip {master_ip} in registry")
 
-    confirmed = await _select_confirm_zone(xml, master_ip, body.get("master_device_id", ""), slaves)
+    try:
+        token = await _spotify_svc._get_valid_token()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify token unavailable: {e}")
+
+    try:
+        async with _httpx.AsyncClient(timeout=15.0) as client:
+            devs = (
+                await client.get(
+                    f"{_SPOTIFY_API}/me/player/devices",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            ).json().get("devices", [])
+            device = next((d for d in devs if d.get("name", "").lower() == master_name.lower()), None)
+            if device is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Speaker '{master_name}' is not a visible Spotify Connect device yet. "
+                        "It may need re-priming (restart soundcork) or a moment to register."
+                    ),
+                )
+            kind = uri.split(":")[1]
+            payload = {"uris": [uri]} if kind in ("episode", "track") else {"context_uri": uri}
+            r = await client.put(
+                f"{_SPOTIFY_API}/me/player/play",
+                params={"device_id": device["id"]},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            if r.status_code not in (200, 204):
+                raise HTTPException(status_code=502, detail=f"Spotify play failed: {r.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify Connect playback error: {e}")
+
+    confirmed = await _confirm_play_and_zone(master_ip, body.get("master_device_id", ""), slaves)
 
     return {
         "success": True,
-        "title": title,
+        "title": (body.get("title") or "").strip() or uri,
         "speakers": len(slaves) + 1,
         "play_confirmed": confirmed,
         "uri": uri,

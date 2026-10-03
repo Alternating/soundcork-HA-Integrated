@@ -1556,7 +1556,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         // Playback goes through the speaker's NATIVE Spotify client (DRM) -
         // it only works once a Spotify account is linked on the speakers.
         const accountWarn = st && !st.speaker_account
-          ? '<div class="warn-banner">No Spotify account is linked on the speakers yet (Sources.xml has no SPOTIFY source), so playback will fail. Link a Spotify Premium account via the SoundCork webui first - search and favorites work regardless.</div>'
+          ? '<div class="warn-banner">No Spotify account is linked yet, so playback will fail. Link a Spotify Premium account via the SoundCork webui first - search and favorites work regardless.</div>'
           : '';
         const favsHtml = `
           <div class="pandora-acct-header">Spotify Favorites</div>
