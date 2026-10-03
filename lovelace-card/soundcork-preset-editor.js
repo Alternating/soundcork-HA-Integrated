@@ -1151,7 +1151,39 @@ class SoundcorkPresetEditor extends HTMLElement {
     const i = this._spSelected.indexOf(uri);
     if (i > -1) this._spSelected.splice(i, 1);
     else this._spSelected.push(uri);
-    this._render();
+    // Patch the DOM in place rather than _render() -- a full re-render
+    // rebuilds the scroll container and snaps the episode list back to the
+    // top on every click (same class of bug as the keystroke re-render).
+    this._spRefreshSelection();
+  }
+
+  _spRefreshSelection() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const sel = this._spSelected || [];
+    root.querySelectorAll('.ep-check').forEach(b => {
+      const pos = sel.indexOf(b.dataset.uri);
+      b.textContent = pos > -1 ? String(pos + 1) : '';
+      b.classList.toggle('checked', pos > -1);
+      const row = b.closest('.result');
+      if (row) row.classList.toggle('ep-selected', pos > -1);
+    });
+    let bar = root.querySelector('.series-bar');
+    if (!sel.length) { if (bar) bar.remove(); return; }
+    if (!bar) {
+      const results = root.querySelector('.results');
+      if (!results) return;
+      bar = document.createElement('div');
+      bar.className = 'series-bar';
+      results.parentNode.insertBefore(bar, results);
+    }
+    bar.innerHTML = `<span>${sel.length} selected &middot; plays in checked order</span>` +
+      '<div class="pandora-btns">' +
+      '<button class="play-btn series-clear">Clear</button>' +
+      `<button class="search-btn series-play" ${this._podcastLoading?'disabled':''}>&#x25B6; Play Series (${sel.length})</button>` +
+      '</div>';
+    bar.querySelector('.series-play').addEventListener('click', () => this._spPlaySeries());
+    bar.querySelector('.series-clear').addEventListener('click', () => { this._spSelected = []; this._spRefreshSelection(); });
   }
 
   async _spPlaySeries() {
@@ -1662,7 +1694,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         }));
         this.shadowRoot.querySelectorAll('.ep-check').forEach(b => b.addEventListener('click', () => this._spToggleSelect(b.dataset.uri)));
         this.shadowRoot.querySelector('.series-play')?.addEventListener('click', () => this._spPlaySeries());
-        this.shadowRoot.querySelector('.series-clear')?.addEventListener('click', () => { this._spSelected = []; this._render(); });
+        this.shadowRoot.querySelector('.series-clear')?.addEventListener('click', () => { this._spSelected = []; this._spRefreshSelection(); });
       } else {
         const si = this.shadowRoot.getElementById('sp-search');
         // Search fires on Enter/button ONLY (commit 1b1c611 lesson: a
