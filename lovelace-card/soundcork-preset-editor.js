@@ -181,7 +181,17 @@ class SoundcorkPresetEditor extends HTMLElement {
     return idx >= 0 ? idx : 0;
   }
 
+  // Release the server-side podcast queue when the user explicitly starts
+  // other playback (a preset, Pandora, power-off), so the supervisor doesn't
+  // later advance a stale queue over it. Fire-and-forget.
+  _queueRelease() {
+    fetch(`${this._baseUrl}/api/v1/queue/control`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'stop'})
+    }).catch(()=>{});
+  }
+
   async _playWithZone(xml) {
+    this._queueRelease();
     const targets = this._getTargetSpeakers();
     if (!targets.length) return;
     // Filter to only reachable speakers before building zone
@@ -234,6 +244,7 @@ class SoundcorkPresetEditor extends HTMLElement {
 
   async _playPreset(preset) {
     if (this._playing) return;
+    this._queueRelease();
     this._playing = preset.id;
     this._render();
     const targets = this._getTargetSpeakers();
@@ -312,6 +323,7 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   async _turnOffAll() {
+    this._queueRelease();
     // Clear zone on first (master) speaker before powering off
     const ips = this._getSpeakerIps();
     if (ips.length > 1) {

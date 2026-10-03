@@ -3023,9 +3023,12 @@ async def _queue_item_finished(item: dict) -> bool:
 
 
 async def _queue_master_diverged(item: dict) -> bool:
-    """Has the user taken the master over with something that isn't our queue
-    item (e.g. started a radio preset)? If so the session must stand down
-    instead of fighting to resume/advance the podcast."""
+    """Should the session stand down? Only on an UNAMBIGUOUS signal: the master
+    went to STANDBY (user powered it off / stopped). Deliberately does NOT
+    compare itemName/source -- those gave false positives that killed a live
+    session mid-episode (the speaker's displayed title doesn't always match our
+    stored title). Explicit preset takeover is handled by the card calling
+    /queue/control stop instead."""
     if _q["paused"]:
         return False
     if asyncio.get_event_loop().time() - _q["started_at"] < _Q_START_GRACE:
@@ -3035,14 +3038,7 @@ async def _queue_master_diverged(item: dict) -> bool:
             txt = (await client.get(_speaker_url(_q["master_ip"], "/nowPlaying"))).text
     except Exception:
         return False
-    if (item.get("provider") or "spotify") == "spotify":
-        # our Spotify item plays on the SPOTIFY source; a preset switches source
-        return 'source="SPOTIFY"' not in txt and "STANDBY" not in txt
-    m = re.search(r"<itemName>([^<]*)</itemName>", txt)
-    name = (m.group(1) if m else "").strip()
-    title = (item.get("title") or "").strip()
-    # a different, non-empty itemName on the master = user started other content
-    return bool(name and title and name[:40] != title[:40])
+    return 'source="STANDBY"' in txt
 
 
 async def _queue_supervisor():
