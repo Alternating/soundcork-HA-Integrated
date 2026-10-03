@@ -1932,7 +1932,7 @@ function renderConfig(main) {
     <div class="card">
       <p class="text-muted text-sm mb-2">Server configuration is managed via environment variables. These values are read-only.</p>
       <div class="detail-row"><span class="detail-row-label">Server URL</span><span class="detail-row-value mono">${escapeHtml(cfg.baseUrl || window.location.origin)}</span></div>
-      <div class="detail-row"><span class="detail-row-label">Spotify</span><span class="detail-row-value">${cfg.hasSpotify ? '<span class="badge badge-spotify">Connected</span>' : '<span class="badge">Not configured</span>'}</span></div>
+      <div class="detail-row"><span class="detail-row-label">Spotify</span><span class="detail-row-value">${cfg.hasSpotify ? '<span class="badge badge-spotify">Credentials configured</span>' : '<span class="badge">Not configured</span>'}</span></div>
       <div class="detail-row"><span class="detail-row-label">Speakers</span><span class="detail-row-value">${state.speakers.length} saved</span></div>
     </div>
     <div class="card mt-2">
