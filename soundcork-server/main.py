@@ -3623,6 +3623,105 @@ async def api_spotify_play(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Spotify transport: live playback state + play/pause/next/prev/seek. All via
+# the Spotify Web API against the account's active Connect device (the speaker
+# we transferred to), which is what gives us seek -- the Bose /key API has no
+# scrub. GET is polled by the card for the progress bar.
+# ---------------------------------------------------------------------------
+
+
+async def _spotify_token_or_503():
+    from soundcork.mgmt import spotify as _spotify_svc
+
+    if not _spotify_svc.list_accounts():
+        raise HTTPException(status_code=409, detail="No Spotify account linked")
+    try:
+        return await _spotify_svc._get_valid_token()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify token unavailable: {e}")
+
+
+@app.get("/api/v1/spotify/playback", tags=["soundcork-api"])
+async def api_spotify_playback():
+    """Current Spotify playback state for the now-playing/transport bar.
+
+    Returns {playing: false} when nothing is active (Spotify returns 204).
+    Otherwise {playing, progress_ms, duration_ms, title, artist, image,
+    device, is_podcast, uri}.
+    """
+    token = await _spotify_token_or_503()
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{_SPOTIFY_API}/me/player",
+                params={"additional_types": "episode"},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify playback state failed: {e}")
+    if r.status_code == 204 or not r.content:
+        return {"playing": False}
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Spotify playback state error: {r.text[:200]}")
+    d = r.json()
+    item = d.get("item") or {}
+    is_ep = item.get("type") == "episode"
+    if is_ep:
+        artist = (item.get("show") or {}).get("name", "")
+        images = (item.get("images") or []) or ((item.get("show") or {}).get("images") or [])
+    else:
+        artist = ", ".join(a.get("name", "") for a in (item.get("artists") or []))
+        images = (item.get("album") or {}).get("images") or []
+    return {
+        "playing": bool(d.get("is_playing")),
+        "progress_ms": d.get("progress_ms") or 0,
+        "duration_ms": item.get("duration_ms") or 0,
+        "title": item.get("name", ""),
+        "artist": artist,
+        "image": _spotify_image(images),
+        "device": (d.get("device") or {}).get("name", ""),
+        "is_podcast": is_ep,
+        "uri": item.get("uri", ""),
+    }
+
+
+@app.post("/api/v1/spotify/control", tags=["soundcork-api"])
+async def api_spotify_control(request: Request):
+    """Transport control. Body: {action: play|pause|next|previous|seek,
+    position_ms?} acting on the account's active Connect device."""
+    body = await request.json()
+    action = (body.get("action") or "").strip()
+    token = await _spotify_token_or_503()
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            if action == "play":
+                r = await client.put(f"{_SPOTIFY_API}/me/player/play", headers=headers)
+            elif action == "pause":
+                r = await client.put(f"{_SPOTIFY_API}/me/player/pause", headers=headers)
+            elif action == "next":
+                r = await client.post(f"{_SPOTIFY_API}/me/player/next", headers=headers)
+            elif action == "previous":
+                r = await client.post(f"{_SPOTIFY_API}/me/player/previous", headers=headers)
+            elif action == "seek":
+                pos = int(body.get("position_ms", -1))
+                if pos < 0:
+                    raise HTTPException(status_code=400, detail="seek needs position_ms >= 0")
+                r = await client.put(
+                    f"{_SPOTIFY_API}/me/player/seek", params={"position_ms": pos}, headers=headers
+                )
+            else:
+                raise HTTPException(status_code=400, detail="action must be play|pause|next|previous|seek")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify control error: {e}")
+    if r.status_code not in (200, 202, 204):
+        raise HTTPException(status_code=502, detail=f"Spotify {action} failed: {r.text[:200]}")
+    return {"success": True, "action": action}
+
+
+# ---------------------------------------------------------------------------
 # Server-side group playback orchestration
 # The browser makes ONE fire-and-forget call; the server runs the full
 # sequence (clear zones -> play master -> confirm PLAY_STATE -> zone slaves)

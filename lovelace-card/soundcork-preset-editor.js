@@ -661,6 +661,20 @@ class SoundcorkPresetEditor extends HTMLElement {
     .result.ep-selected{background:rgba(3,169,244,.1)}
     .series-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:8px 10px;margin-bottom:8px;border-radius:8px;background:rgba(3,169,244,.12);font-size:12px;color:var(--primary-text-color)}
     .series-play{white-space:nowrap}
+    .np-bar{background:var(--secondary-background-color,#2a2a40);border-radius:10px;padding:12px;margin-bottom:12px}
+    .np-top{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+    .np-art{width:46px;height:46px;border-radius:6px;overflow:hidden;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;font-size:22px}
+    .np-art img{width:100%;height:100%;object-fit:cover}
+    .np-meta{flex:1;min-width:0}
+    .np-title{font-size:13px;font-weight:700;color:var(--primary-text-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .np-artist{font-size:11px;color:var(--secondary-text-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .np-seek{height:8px;border-radius:5px;background:var(--divider-color,#444);cursor:pointer;overflow:hidden}
+    .np-seek-fill{height:100%;background:var(--primary-color,#03a9f4);border-radius:5px;transition:width .25s linear;pointer-events:none}
+    .np-times{display:flex;justify-content:space-between;font-size:10px;color:var(--secondary-text-color);margin:4px 1px 8px}
+    .np-controls{display:flex;align-items:center;justify-content:center;gap:18px}
+    .np-btn{background:none;border:none;cursor:pointer;color:var(--primary-text-color);font-size:20px;padding:4px 8px;border-radius:6px;transition:color .15s,background .15s}
+    .np-btn:hover{color:var(--primary-color)}
+    .np-play{font-size:26px}
     .fav-del:hover{color:#ff6b6b}
     .pod-adv{margin-top:12px}
     .pod-adv summary{font-size:11px;color:var(--secondary-text-color);cursor:pointer;margin-bottom:8px}
@@ -1142,6 +1156,111 @@ class SoundcorkPresetEditor extends HTMLElement {
   async _spPlay(uri, title, image) {
     return this._spPlayBody({ uri, title, image: image || '' }, title);
   }
+
+  // --- Transport: live now-playing bar with play/pause/next/prev/seek ---
+
+  _spStartPolling() {
+    if (this._spPollTimer) return;
+    const tick = async () => {
+      if (this._mode !== 'spotify' || !this.isConnected) { this._spStopPolling(); return; }
+      try {
+        const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal: AbortSignal.timeout(6000)});
+        this._spNow = await r.json();
+        this._spNowAt = Date.now();
+      } catch(e) { /* keep last state on a transient failure */ }
+      this._spUpdateNowBar();
+    };
+    tick();
+    // poll server for truth every 4s; a 1s local ticker interpolates the bar
+    this._spPollTimer = setInterval(tick, 4000);
+    this._spTickTimer = setInterval(() => this._spUpdateNowBar(), 1000);
+  }
+
+  _spStopPolling() {
+    if (this._spPollTimer) { clearInterval(this._spPollTimer); this._spPollTimer = null; }
+    if (this._spTickTimer) { clearInterval(this._spTickTimer); this._spTickTimer = null; }
+  }
+
+  _spNowProgress() {
+    const n = this._spNow;
+    if (!n || !n.playing) return n ? (n.progress_ms || 0) : 0;
+    // interpolate between 4s polls so the bar moves every second
+    return Math.min((n.progress_ms || 0) + (Date.now() - (this._spNowAt || Date.now())), n.duration_ms || 0);
+  }
+
+  _fmtClock(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    const m = Math.floor(s / 60), ss = String(s % 60).padStart(2, '0');
+    return m >= 60 ? `${Math.floor(m/60)}:${String(m%60).padStart(2,'0')}:${ss}` : `${m}:${ss}`;
+  }
+
+  _spUpdateNowBar() {
+    const wrap = this.shadowRoot && this.shadowRoot.getElementById('sp-now');
+    if (!wrap) return;
+    const n = this._spNow;
+    if (!n || !n.title) { wrap.innerHTML = ''; return; }
+    const pos = this._spNowProgress(), dur = n.duration_ms || 0;
+    const pct = dur ? Math.min(100, (pos / dur) * 100) : 0;
+    const build = !wrap.querySelector('.np-bar');
+    if (build) {
+      wrap.innerHTML =
+        '<div class="np-bar">' +
+          '<div class="np-top">' +
+            '<div class="np-art" id="np-art"></div>' +
+            '<div class="np-meta"><div class="np-title" id="np-title"></div><div class="np-artist" id="np-artist"></div></div>' +
+          '</div>' +
+          '<div class="np-seek" id="np-seek"><div class="np-seek-fill" id="np-seek-fill"></div></div>' +
+          '<div class="np-times"><span id="np-elapsed"></span><span id="np-total"></span></div>' +
+          '<div class="np-controls">' +
+            '<button class="np-btn" id="np-prev" title="Previous">&#x23EE;</button>' +
+            '<button class="np-btn np-play" id="np-playpause" title="Play/Pause"></button>' +
+            '<button class="np-btn" id="np-next" title="Next">&#x23ED;</button>' +
+          '</div>' +
+        '</div>';
+      wrap.querySelector('#np-prev').addEventListener('click', () => this._spControl('previous'));
+      wrap.querySelector('#np-next').addEventListener('click', () => this._spControl('next'));
+      wrap.querySelector('#np-playpause').addEventListener('click', () => this._spControl(this._spNow && this._spNow.playing ? 'pause' : 'play'));
+      wrap.querySelector('#np-seek').addEventListener('click', (e) => {
+        const d = this._spNow && this._spNow.duration_ms; if (!d) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        this._spControl('seek', Math.round(frac * d));
+      });
+    }
+    wrap.querySelector('#np-art').innerHTML = n.image ? `<img src="${this._esc(n.image)}" alt=""/>` : '&#x1F3A7;';
+    wrap.querySelector('#np-title').textContent = n.title;
+    wrap.querySelector('#np-artist').textContent = n.artist || '';
+    wrap.querySelector('#np-seek-fill').style.width = pct + '%';
+    wrap.querySelector('#np-elapsed').textContent = this._fmtClock(pos);
+    wrap.querySelector('#np-total').textContent = dur ? this._fmtClock(dur) : '';
+    wrap.querySelector('#np-playpause').innerHTML = n.playing ? '&#x23F8;' : '&#x25B6;';
+  }
+
+  async _spControl(action, positionMs) {
+    // optimistic UI so the button/bar respond instantly
+    if (this._spNow) {
+      if (action === 'pause') this._spNow.playing = false;
+      else if (action === 'play') { this._spNow.playing = true; this._spNowAt = Date.now(); }
+      else if (action === 'seek' && positionMs != null) { this._spNow.progress_ms = positionMs; this._spNowAt = Date.now(); }
+      this._spUpdateNowBar();
+    }
+    try {
+      const body = { action };
+      if (action === 'seek') body.position_ms = positionMs;
+      await fetch(`${this._baseUrl}/api/v1/spotify/control`, {
+        method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+      });
+    } catch(e) { /* next poll reconciles */ }
+    // re-sync shortly after (next/prev change the track)
+    setTimeout(async () => {
+      try {
+        const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal: AbortSignal.timeout(6000)});
+        this._spNow = await r.json(); this._spNowAt = Date.now(); this._spUpdateNowBar();
+      } catch(e) {}
+    }, action === 'seek' ? 400 : 700);
+  }
+
+  disconnectedCallback() { this._spStopPolling(); }
 
   // Selection order == play order. _spSelected holds episode URIs in the
   // order the user checked them; "Play Series" sends them as an ordered
@@ -1669,8 +1788,12 @@ class SoundcorkPresetEditor extends HTMLElement {
         <h3>Spotify-Podcasts</h3>
         ${chipsHtml}
         ${statusHtml}
+        <div id="sp-now"></div>
         ${bodyHtml}
       </div></ha-card>`;
+
+      this._spUpdateNowBar();
+      this._spStartPolling();
 
       this.shadowRoot.querySelectorAll('.spk-chip').forEach(chip => {
         chip.addEventListener('click', () => {
