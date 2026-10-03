@@ -3661,6 +3661,24 @@ async def api_spotify_play(request: Request):
     )
 
 
+def _match_connect_device(devices: list, speaker_name: str):
+    """Find the Connect device for a speaker. When a speaker is a zone
+    master, Spotify renames its Connect device "<Name> Group" (e.g. Kitchen
+    -> "Kitchen Group"), so an exact match alone misses zoned speakers."""
+    mn = (speaker_name or "").lower()
+    exact = next((d for d in devices if d.get("name", "").lower() == mn), None)
+    if exact:
+        return exact
+    return next(
+        (
+            d
+            for d in devices
+            if d.get("name", "").lower() == f"{mn} group" or d.get("name", "").lower().startswith(mn + " ")
+        ),
+        None,
+    )
+
+
 async def _spotify_connect_play(uri, uris, title, master_ip, master_device_id, slaves):
     """Core Spotify Connect playback, shared by /spotify/play and the
     playlist player. `uris` (ordered episode/track list) wins over single
@@ -3709,7 +3727,7 @@ async def _spotify_connect_play(uri, uris, title, master_ip, master_device_id, s
                     headers={"Authorization": f"Bearer {token}"},
                 )
             ).json().get("devices", [])
-            device = next((d for d in devs if d.get("name", "").lower() == master_name.lower()), None)
+            device = _match_connect_device(devs, master_name)
             if device is None:
                 raise HTTPException(
                     status_code=503,
@@ -3859,6 +3877,44 @@ async def api_spotify_queue():
     }
 
 
+async def _spotify_playlist_skip(client, headers, action):
+    """Advance/retreat through the soundcork playlist. Returns the httpx
+    response of whatever Spotify call was made (play batch, or native skip)."""
+    pb = await client.get(
+        f"{_SPOTIFY_API}/me/player", params={"additional_types": "episode"}, headers=headers
+    )
+    cur_uri = None
+    dev = None
+    if pb.status_code == 200 and pb.content:
+        pbd = pb.json()
+        cur_uri = (pbd.get("item") or {}).get("uri")
+        dev = (pbd.get("device") or {}).get("id")
+    uris = [i.get("uri") for i in _load_spotify_playlist() if i.get("uri")]
+    idx = uris.index(cur_uri) if cur_uri in uris else -1
+    if idx >= 0:
+        target = idx + 1 if action == "next" else idx - 1
+        if 0 <= target < len(uris):
+            params = {"device_id": dev} if dev else {}
+            return await client.put(
+                f"{_SPOTIFY_API}/me/player/play",
+                params=params,
+                headers={**headers, "Content-Type": "application/json"},
+                json={"uris": uris[target:]},  # keep the rest queued after the target
+            )
+        # at an end of the playlist: next past the last = stop-ish (replay last);
+        # previous before the first = restart current
+        params = {"device_id": dev} if dev else {}
+        return await client.put(
+            f"{_SPOTIFY_API}/me/player/play",
+            params=params,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"uris": uris[idx:]},
+        )
+    # current item isn't in our playlist -> Spotify's native skip
+    verb = "next" if action == "next" else "previous"
+    return await client.post(f"{_SPOTIFY_API}/me/player/{verb}", headers=headers)
+
+
 @app.post("/api/v1/spotify/control", tags=["soundcork-api"])
 async def api_spotify_control(request: Request):
     """Transport control. Body: {action: play|pause|next|previous|seek|clear,
@@ -3879,10 +3935,14 @@ async def api_spotify_control(request: Request):
                 r = await client.put(f"{_SPOTIFY_API}/me/player/play", headers=headers)
             elif action == "pause":
                 r = await client.put(f"{_SPOTIFY_API}/me/player/pause", headers=headers)
-            elif action == "next":
-                r = await client.post(f"{_SPOTIFY_API}/me/player/next", headers=headers)
-            elif action == "previous":
-                r = await client.post(f"{_SPOTIFY_API}/me/player/previous", headers=headers)
+            elif action in ("next", "previous"):
+                # Playlist-aware skip: if the current episode is in OUR
+                # playlist, jump to the adjacent playlist item and keep the
+                # rest queued (a play call, so it works even when paused/idle
+                # -- Spotify's native next no-ops on an inactive device and
+                # restarts a single-item context). Falls back to Spotify's
+                # native skip when the current item isn't in the playlist.
+                r = await _spotify_playlist_skip(client, headers, action)
             elif action == "seek":
                 pos = int(body.get("position_ms", -1))
                 if pos < 0:
