@@ -55,9 +55,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._spShow = null;
     this._spEpisodes = [];
     this._spLoading = false;
-    this._spSelected = []; // episode URIs in checked order (series play)
+    this._spPlaylist = []; // soundcork-managed editable playlist
     this._spQueueOpen = false;
-    this._spQueue = null;
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -657,12 +656,12 @@ class SoundcorkPresetEditor extends HTMLElement {
     .back-btn{background:var(--secondary-background-color,#2a2a40);border:none;cursor:pointer;color:var(--primary-text-color);font-size:16px;padding:8px 12px;border-radius:8px;flex-shrink:0}
     .back-btn:hover{background:rgba(3,169,244,.2)}
     .fav-del{background:none;border:none;cursor:pointer;font-size:14px;color:var(--secondary-text-color);padding:4px 6px;flex-shrink:0;transition:color .15s}
-    .ep-check{flex-shrink:0;width:24px;height:24px;border-radius:6px;border:1.5px solid var(--divider-color,#555);background:transparent;color:#fff;font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,border-color .15s}
-    .ep-check:hover{border-color:var(--primary-color)}
-    .ep-check.checked{background:var(--primary-color,#03a9f4);border-color:var(--primary-color,#03a9f4)}
-    .result.ep-selected{background:rgba(3,169,244,.1)}
-    .series-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:8px 10px;margin-bottom:8px;border-radius:8px;background:rgba(3,169,244,.12);font-size:12px;color:var(--primary-text-color)}
-    .series-play{white-space:nowrap}
+    .sp-add{flex-shrink:0;width:26px;height:26px;border-radius:50%;border:1.5px solid var(--divider-color,#555);background:transparent;color:var(--primary-text-color);font-size:15px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,border-color .15s,color .15s}
+    .sp-add:hover{border-color:var(--primary-color);color:var(--primary-color)}
+    .sp-add.added{background:var(--primary-color,#03a9f4);border-color:var(--primary-color,#03a9f4);color:#fff}
+    .npq-num{flex-shrink:0;width:18px;text-align:center;font-size:11px;font-weight:700;color:var(--secondary-text-color)}
+    .npq-del{flex-shrink:0;background:none;border:none;cursor:pointer;font-size:13px;color:var(--secondary-text-color);padding:4px 6px;transition:color .15s}
+    .npq-del:hover{color:#ff6b6b}
     .np-bar{background:var(--secondary-background-color,#2a2a40);border-radius:10px;padding:12px;margin-bottom:12px}
     .np-top{display:flex;align-items:center;gap:10px;margin-bottom:10px}
     .np-art{width:46px;height:46px;border-radius:6px;overflow:hidden;flex-shrink:0;background:#333;display:flex;align-items:center;justify-content:center;font-size:22px}
@@ -1108,12 +1107,14 @@ class SoundcorkPresetEditor extends HTMLElement {
 
   async _loadSpotify() {
     try {
-      const [sr, fr] = await Promise.all([
+      const [sr, fr, pr] = await Promise.all([
         fetch(`${this._baseUrl}/api/v1/spotify/status`, {signal: AbortSignal.timeout(10000)}),
         fetch(`${this._baseUrl}/api/v1/podcasts/favorites?provider=spotify`, {signal: AbortSignal.timeout(5000)}),
+        fetch(`${this._baseUrl}/api/v1/spotify/playlist`, {signal: AbortSignal.timeout(5000)}),
       ]);
       this._spStatus = await sr.json();
       this._spFavorites = (await fr.json()).favorites || [];
+      this._spPlaylist = (await pr.json()).items || [];
     } catch(e) { console.warn('SoundCork: loadSpotify failed', e); }
     this._render();
   }
@@ -1259,50 +1260,32 @@ class SoundcorkPresetEditor extends HTMLElement {
 
   async _spToggleQueue() {
     this._spQueueOpen = !this._spQueueOpen;
-    if (this._spQueueOpen) await this._spLoadQueue();
+    if (this._spQueueOpen) await this._spLoadPlaylist();
     this._spRenderQueue();
     const qbtn = this.shadowRoot && this.shadowRoot.querySelector('#np-queue-btn');
     if (qbtn) qbtn.classList.toggle('active', this._spQueueOpen);
-  }
-
-  async _spLoadQueue() {
-    try {
-      const r = await fetch(`${this._baseUrl}/api/v1/spotify/queue`, {signal: AbortSignal.timeout(8000)});
-      this._spQueue = await r.json();
-    } catch(e) { this._spQueue = {current:null, queue:[]}; }
   }
 
   _spRenderQueue() {
     const panel = this.shadowRoot && this.shadowRoot.getElementById('np-queue');
     if (!panel) return;
     if (!this._spQueueOpen) { panel.innerHTML = ''; return; }
-    const q = this._spQueue || {queue:[]};
-    const up = q.queue || [];
-    const rows = up.length ? up.map(it => `
+    const items = this._spPlaylist || [];
+    const rows = items.length ? items.map((it, idx) => `
       <div class="npq-row">
+        <div class="npq-num">${idx+1}</div>
         <div class="npq-art">${it.image?`<img src="${this._esc(it.image)}" alt=""/>`:'&#x1F3A7;'}</div>
-        <div class="npq-info"><div class="npq-title">${this._esc(it.title)}</div><div class="npq-sub">${this._esc(it.artist)}${this._fmtDuration(Math.round((it.duration_ms||0)/1000))?' &middot; '+this._fmtDuration(Math.round((it.duration_ms||0)/1000)):''}</div></div>
-      </div>`).join('') : '<div class="empty" style="padding:8px 0">Nothing queued</div>';
+        <div class="npq-info"><div class="npq-title">${this._esc(it.title)}</div><div class="npq-sub">${this._esc(it.artist||'')}${this._fmtDuration(Math.round((it.duration_ms||0)/1000))?' &middot; '+this._fmtDuration(Math.round((it.duration_ms||0)/1000)):''}</div></div>
+        <button class="npq-del" data-uri="${this._esc(it.uri)}" title="Remove">&#x2715;</button>
+      </div>`).join('') : '<div class="empty" style="padding:8px 0">Your playlist is empty - add episodes with the + button</div>';
     panel.innerHTML =
-      '<div class="npq-head"><span>Up next</span>' +
-      (up.length ? '<button class="play-btn npq-clear">Clear upcoming</button>' : '') + '</div>' +
-      `<div class="npq-list">${rows}</div>` +
-      '<div class="npq-note">Spotify keeps its own suggestions in a show’s queue; Clear cancels the episodes you queued.</div>';
-    const cb = panel.querySelector('.npq-clear');
-    if (cb) cb.addEventListener('click', () => this._spClearQueue());
-  }
-
-  async _spClearQueue() {
-    const panel = this.shadowRoot && this.shadowRoot.getElementById('np-queue');
-    if (panel) { const c = panel.querySelector('.npq-clear'); if (c) { c.textContent = 'Clearing...'; c.disabled = true; } }
-    try {
-      await fetch(`${this._baseUrl}/api/v1/spotify/control`, {
-        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({action:'clear'})
-      });
-    } catch(e) {}
-    setTimeout(async () => { await this._spLoadQueue(); this._spRenderQueue();
-      try { const r = await fetch(`${this._baseUrl}/api/v1/spotify/playback`, {signal:AbortSignal.timeout(6000)}); this._spNow = await r.json(); this._spNowAt = Date.now(); this._spUpdateNowBar(); } catch(e) {}
-    }, 1200);
+      '<div class="npq-head"><span>Playlist' + (items.length?` (${items.length})`:'') + '</span>' +
+      (items.length ? '<div class="pandora-btns"><button class="play-btn npq-clear">Clear all</button><button class="search-btn npq-playall" ' + (this._podcastLoading?'disabled':'') + '>&#x25B6; Play all</button></div>' : '') +
+      '</div>' +
+      `<div class="npq-list">${rows}</div>`;
+    panel.querySelectorAll('.npq-del').forEach(b => b.addEventListener('click', () => this._spRemoveFromPlaylist(b.dataset.uri)));
+    const clr = panel.querySelector('.npq-clear'); if (clr) clr.addEventListener('click', () => this._spClearPlaylist());
+    const pa = panel.querySelector('.npq-playall'); if (pa) pa.addEventListener('click', () => this._spPlayPlaylist());
   }
 
   async _spControl(action, positionMs) {
@@ -1331,55 +1314,86 @@ class SoundcorkPresetEditor extends HTMLElement {
 
   disconnectedCallback() { this._spStopPolling(); }
 
-  // Selection order == play order. _spSelected holds episode URIs in the
-  // order the user checked them; "Play Series" sends them as an ordered
-  // list that Spotify plays back-to-back natively.
-  _spToggleSelect(uri) {
-    if (!this._spSelected) this._spSelected = [];
-    const i = this._spSelected.indexOf(uri);
-    if (i > -1) this._spSelected.splice(i, 1);
-    else this._spSelected.push(uri);
-    // Patch the DOM in place rather than _render() -- a full re-render
-    // rebuilds the scroll container and snaps the episode list back to the
-    // top on every click (same class of bug as the keystroke re-render).
-    this._spRefreshSelection();
+  // --- Soundcork-managed playlist (add/remove/clear, authoritative) ---
+  // A real editable queue the user builds by hand, held server-side. Unlike
+  // Spotify's own queue it has no autoplay padding and supports per-item
+  // removal. "Play all" sends the ordered list to Spotify as one uris[] batch.
+
+  async _spLoadPlaylist() {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/playlist`, {signal: AbortSignal.timeout(6000)});
+      this._spPlaylist = (await r.json()).items || [];
+    } catch(e) { this._spPlaylist = this._spPlaylist || []; }
   }
 
-  _spRefreshSelection() {
-    const root = this.shadowRoot;
-    if (!root) return;
-    const sel = this._spSelected || [];
-    root.querySelectorAll('.ep-check').forEach(b => {
-      const pos = sel.indexOf(b.dataset.uri);
-      b.textContent = pos > -1 ? String(pos + 1) : '';
-      b.classList.toggle('checked', pos > -1);
-      const row = b.closest('.result');
-      if (row) row.classList.toggle('ep-selected', pos > -1);
+  _spInPlaylist(uri) { return (this._spPlaylist || []).some(i => i.uri === uri); }
+
+  async _spAddToPlaylist(ep) {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/playlist/add`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ uri: ep.uri, title: ep.title, artist: (this._spShow && this._spShow.name) || ep.artist || '', image: ep.image || (this._spShow && this._spShow.image) || '', duration_ms: ep.duration_ms || (ep.duration_seconds ? ep.duration_seconds*1000 : 0) })
+      });
+      this._spPlaylist = (await r.json()).items || [];
+    } catch(e) {}
+    this._spRefreshAddButtons();
+    if (this._spQueueOpen) this._spRenderQueue();
+  }
+
+  async _spRemoveFromPlaylist(uri) {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/playlist/remove`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ uri })
+      });
+      this._spPlaylist = (await r.json()).items || [];
+    } catch(e) {}
+    this._spRenderQueue();
+    this._spRefreshAddButtons();
+  }
+
+  async _spClearPlaylist() {
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/playlist/clear`, {method:'POST'});
+      this._spPlaylist = (await r.json()).items || [];
+    } catch(e) {}
+    this._spRenderQueue();
+    this._spRefreshAddButtons();
+  }
+
+  // reflect add/remove on the episode rows' +/check buttons without a re-render
+  _spRefreshAddButtons() {
+    if (!this.shadowRoot) return;
+    this.shadowRoot.querySelectorAll('.sp-add').forEach(b => {
+      const inList = this._spInPlaylist(b.dataset.uri);
+      b.classList.toggle('added', inList);
+      b.innerHTML = inList ? '&#x2713;' : '&#x2b;';
+      b.title = inList ? 'In playlist (tap to remove)' : 'Add to playlist';
     });
-    let bar = root.querySelector('.series-bar');
-    if (!sel.length) { if (bar) bar.remove(); return; }
-    if (!bar) {
-      const results = root.querySelector('.results');
-      if (!results) return;
-      bar = document.createElement('div');
-      bar.className = 'series-bar';
-      results.parentNode.insertBefore(bar, results);
-    }
-    bar.innerHTML = `<span>${sel.length} selected &middot; plays in checked order</span>` +
-      '<div class="pandora-btns">' +
-      '<button class="play-btn series-clear">Clear</button>' +
-      `<button class="search-btn series-play" ${this._podcastLoading?'disabled':''}>&#x25B6; Play Series (${sel.length})</button>` +
-      '</div>';
-    bar.querySelector('.series-play').addEventListener('click', () => this._spPlaySeries());
-    bar.querySelector('.series-clear').addEventListener('click', () => { this._spSelected = []; this._spRefreshSelection(); });
   }
 
-  async _spPlaySeries() {
-    const uris = (this._spSelected || []).slice();
-    if (!uris.length) return;
-    const label = `${uris.length} episode${uris.length>1?'s':''} from ${this._spShow ? this._spShow.name : 'selection'}`;
-    const ok = await this._spPlayBody({ uris, title: label }, label);
-    if (ok) { this._spSelected = []; this._render(); }
+  async _spPlayPlaylist() {
+    const targets = this._getTargetSpeakers();
+    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
+    this._podcastLoading = true;
+    this._podcastStatus = {type:'loading', msg:'Starting your playlist...'};
+    this._render();
+    const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
+    if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
+    const mi = this._pickMasterIdx(reachable);
+    const master = reachable[mi], slaves = reachable.filter((_, i) => i !== mi);
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/spotify/playlist/play`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ master_ip: master.ip, master_device_id: master.device_id, slaves })
+      });
+      const data = await r.json();
+      this._podcastStatus = (r.ok && data.success)
+        ? {type:'success', msg:`Playing ${data.queued} from your playlist on ${data.speakers} speaker${data.speakers>1?'s':''}`}
+        : {type:'error', msg: data.detail || 'Playback failed'};
+    } catch(e) { this._podcastStatus = {type:'error', msg:'Network error - check SoundCork connection'}; }
+    this._podcastLoading = false;
+    this._render();
+    setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
   }
 
   async _spPlayBody(payload, label) {
@@ -1780,36 +1794,27 @@ class SoundcorkPresetEditor extends HTMLElement {
       let bodyHtml;
       if (this._spView === 'episodes' && this._spShow) {
         const fav = this._spIsFavorite(this._spShow.uri);
-        const sel = this._spSelected || [];
         const eps = this._spLoading
           ? '<div class="loading">Loading episodes...</div>'
           : this._spEpisodes.length ? this._spEpisodes.map((ep, i) => {
-            const pos = sel.indexOf(ep.uri);
+            const inList = this._spInPlaylist(ep.uri);
             return `
-            <div class="result ${pos>-1?'ep-selected':''}">
-              <button class="ep-check ${pos>-1?'checked':''}" data-uri="${this._esc(ep.uri)}" title="Add to series">${pos>-1?(pos+1):''}</button>
+            <div class="result">
               <div class="result-art">${ep.image?`<img src="${this._esc(ep.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
               <div class="result-info">
                 <div class="result-name">${this._esc(ep.title)}</div>
                 <div class="result-sub">${this._esc(ep.date)}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
               </div>
+              <button class="np-btn sp-add ${inList?'added':''}" data-uri="${this._esc(ep.uri)}" data-i="${i}" title="${inList?'In playlist (tap to remove)':'Add to playlist'}">${inList?'&#x2713;':'&#x2b;'}</button>
               <button class="play-btn sp-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
             </div>`;}).join('') : '<div class="empty">No episodes found</div>';
-        const seriesBar = sel.length ? `<div class="series-bar">
-            <span>${sel.length} selected &middot; plays in checked order</span>
-            <div class="pandora-btns">
-              <button class="play-btn series-clear">Clear</button>
-              <button class="search-btn series-play" ${this._podcastLoading?'disabled':''}>&#x25B6; Play Series (${sel.length})</button>
-            </div>
-          </div>` : '';
         bodyHtml = `
           <div class="ep-header">
             <button class="back-btn" id="sp-back" title="Back to shows">&#x2190;</button>
             <div class="result-art">${this._spShow.image?`<img src="${this._esc(this._spShow.image)}" alt=""/>`:'&#x1F399;'}</div>
-            <div class="result-info"><div class="result-name">${this._esc(this._spShow.name)}</div><div class="result-sub">Newest episodes &middot; check to build a series</div></div>
+            <div class="result-info"><div class="result-name">${this._esc(this._spShow.name)}</div><div class="result-sub">Newest episodes &middot; + adds to your playlist</div></div>
             <button class="fav-btn ${fav?'active':''}" id="sp-fav" title="${fav?'Remove favorite':'Save favorite'}">${fav?'&#x2665;':'&#x2661;'}</button>
           </div>
-          ${seriesBar}
           <div class="results">${eps}</div>`;
       } else {
         const favRows = this._spFavorites.map((f, i) => `
@@ -1878,15 +1883,19 @@ class SoundcorkPresetEditor extends HTMLElement {
         });
       });
       if (this._spView === 'episodes' && this._spShow) {
-        this.shadowRoot.getElementById('sp-back')?.addEventListener('click', () => { this._spView = 'list'; this._spShow = null; this._spSelected = []; this._render(); });
+        this.shadowRoot.getElementById('sp-back')?.addEventListener('click', () => { this._spView = 'list'; this._spShow = null; this._render(); });
         this.shadowRoot.getElementById('sp-fav')?.addEventListener('click', () => this._spToggleFavorite(this._spShow));
         this.shadowRoot.querySelectorAll('.sp-ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._spEpisodes[parseInt(b.dataset.i)];
           if (ep) this._spPlay(ep.uri, `${this._spShow.name}: ${ep.title}`, ep.image || this._spShow.image);
         }));
-        this.shadowRoot.querySelectorAll('.ep-check').forEach(b => b.addEventListener('click', () => this._spToggleSelect(b.dataset.uri)));
-        this.shadowRoot.querySelector('.series-play')?.addEventListener('click', () => this._spPlaySeries());
-        this.shadowRoot.querySelector('.series-clear')?.addEventListener('click', () => { this._spSelected = []; this._spRefreshSelection(); });
+        // + adds to (or removes from) the persistent playlist in place
+        this.shadowRoot.querySelectorAll('.sp-add').forEach(b => b.addEventListener('click', () => {
+          const ep = this._spEpisodes[parseInt(b.dataset.i)];
+          if (!ep) return;
+          if (this._spInPlaylist(ep.uri)) this._spRemoveFromPlaylist(ep.uri);
+          else this._spAddToPlaylist(ep);
+        }));
       } else {
         const si = this.shadowRoot.getElementById('sp-search');
         // Search fires on Enter/button ONLY (commit 1b1c611 lesson: a

@@ -3407,6 +3407,123 @@ def _spotify_image(images: list) -> str:
     return pick.get("url", "")
 
 
+# ---------------------------------------------------------------------------
+# Soundcork-managed Spotify playlist. A real editable queue the user builds
+# by hand (add/remove/clear/reorder), persisted to disk and authoritative --
+# unlike Spotify's own /me/player/queue, which is opaque, un-editable
+# per-item, and pads podcasts with autoplay suggestions. "Play all" pushes
+# this ordered list to Spotify as a uris[] batch (plays in order natively).
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_PLAYLIST_PATH = os.path.join(settings.data_dir, "spotify_playlist.json")
+_spotify_playlist_lock = asyncio.Lock()
+
+
+def _load_spotify_playlist() -> list:
+    try:
+        with open(_SPOTIFY_PLAYLIST_PATH, "r") as f:
+            items = _json.load(f)
+            return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def _save_spotify_playlist(items: list) -> None:
+    with open(_SPOTIFY_PLAYLIST_PATH, "w") as f:
+        _json.dump(items, f, indent=2)
+
+
+@app.get("/api/v1/spotify/playlist", tags=["soundcork-api"])
+async def api_spotify_playlist():
+    """The user's editable Spotify playlist (ordered)."""
+    return {"items": _load_spotify_playlist()}
+
+
+@app.post("/api/v1/spotify/playlist/add", tags=["soundcork-api"])
+async def api_spotify_playlist_add(request: Request):
+    """Append an episode/track. Body: {uri, title, artist?, image?,
+    duration_ms?}. No-op if the uri is already in the list."""
+    body = await request.json()
+    uri = (body.get("uri") or "").strip()
+    if not re.fullmatch(r"spotify:(episode|track):[A-Za-z0-9]+", uri):
+        raise HTTPException(status_code=400, detail="uri must be a spotify:episode: or spotify:track: URI")
+    async with _spotify_playlist_lock:
+        items = _load_spotify_playlist()
+        if not any(i.get("uri") == uri for i in items):
+            items.append(
+                {
+                    "uri": uri,
+                    "title": (body.get("title") or "").strip() or uri,
+                    "artist": (body.get("artist") or "").strip(),
+                    "image": (body.get("image") or "").strip(),
+                    "duration_ms": body.get("duration_ms") or 0,
+                }
+            )
+            _save_spotify_playlist(items)
+    return {"items": _load_spotify_playlist()}
+
+
+@app.post("/api/v1/spotify/playlist/remove", tags=["soundcork-api"])
+async def api_spotify_playlist_remove(request: Request):
+    """Remove one item by uri. Body: {uri}."""
+    body = await request.json()
+    uri = (body.get("uri") or "").strip()
+    async with _spotify_playlist_lock:
+        items = [i for i in _load_spotify_playlist() if i.get("uri") != uri]
+        _save_spotify_playlist(items)
+    return {"items": items}
+
+
+@app.post("/api/v1/spotify/playlist/move", tags=["soundcork-api"])
+async def api_spotify_playlist_move(request: Request):
+    """Reorder: move item `uri` to position `to` (0-based). Body: {uri, to}."""
+    body = await request.json()
+    uri = (body.get("uri") or "").strip()
+    try:
+        to = int(body.get("to"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="to must be an integer index")
+    async with _spotify_playlist_lock:
+        items = _load_spotify_playlist()
+        idx = next((n for n, i in enumerate(items) if i.get("uri") == uri), None)
+        if idx is not None:
+            it = items.pop(idx)
+            items.insert(max(0, min(to, len(items))), it)
+            _save_spotify_playlist(items)
+    return {"items": _load_spotify_playlist()}
+
+
+@app.post("/api/v1/spotify/playlist/clear", tags=["soundcork-api"])
+async def api_spotify_playlist_clear():
+    """Empty the playlist."""
+    async with _spotify_playlist_lock:
+        _save_spotify_playlist([])
+    return {"items": []}
+
+
+@app.post("/api/v1/spotify/playlist/play", tags=["soundcork-api"])
+async def api_spotify_playlist_play(request: Request):
+    """Play the whole playlist in order on speakers. Body: {master_ip,
+    master_device_id, slaves, start_uri?}. start_uri plays from that item
+    onward (the rest still follow in order)."""
+    body = await request.json()
+    items = _load_spotify_playlist()
+    if not items:
+        raise HTTPException(status_code=400, detail="playlist is empty")
+    uris = [i["uri"] for i in items if i.get("uri")]
+    start = (body.get("start_uri") or "").strip()
+    if start and start in uris:
+        uris = uris[uris.index(start):]
+    return await _spotify_connect_play(
+        "",
+        uris,
+        f"{len(uris)} from your playlist",
+        body.get("master_ip", ""),
+        body.get("master_device_id", ""),
+        body.get("slaves", []),
+    )
+
+
 @app.get("/api/v1/spotify/status", tags=["soundcork-api"])
 async def api_spotify_status():
     """Card bootstrap: is search usable, and can the speakers play natively?
@@ -3531,17 +3648,27 @@ async def api_spotify_play(request: Request):
 
     409s when no Spotify account is linked (nothing primed the speakers).
     """
-    from soundcork.mgmt import spotify as _spotify_svc
-
     body = await request.json()
     uri = (body.get("uri") or "").strip()
     uris = [u.strip() for u in (body.get("uris") or []) if isinstance(u, str) and u.strip()]
-    master_ip = body.get("master_ip", "")
-    slaves = body.get("slaves", [])
+    return await _spotify_connect_play(
+        uri,
+        uris,
+        (body.get("title") or "").strip(),
+        body.get("master_ip", ""),
+        body.get("master_device_id", ""),
+        body.get("slaves", []),
+    )
+
+
+async def _spotify_connect_play(uri, uris, title, master_ip, master_device_id, slaves):
+    """Core Spotify Connect playback, shared by /spotify/play and the
+    playlist player. `uris` (ordered episode/track list) wins over single
+    `uri` (which may be a show/album/playlist context)."""
+    from soundcork.mgmt import spotify as _spotify_svc
+
     if not master_ip or not (uri or uris):
         raise HTTPException(status_code=400, detail="master_ip and uri (or uris) are required")
-    # Series play requires episode/track URIs only (context_uri takes one
-    # container; a mixed list isn't a valid Spotify context).
     if uris:
         for u in uris:
             if not re.fullmatch(_SPOTIFY_URI_RE, u) or u.split(":")[1] not in ("episode", "track"):
@@ -3563,7 +3690,6 @@ async def api_spotify_play(request: Request):
             ),
         )
 
-    # Resolve the master speaker's name so we can match its Connect device.
     master_name = next(
         (s.get("name") for s in _speakers_from_file() if s.get("ipAddress") == master_ip), None
     )
@@ -3610,11 +3736,11 @@ async def api_spotify_play(request: Request):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spotify Connect playback error: {e}")
 
-    confirmed = await _confirm_play_and_zone(master_ip, body.get("master_device_id", ""), slaves)
+    confirmed = await _confirm_play_and_zone(master_ip, master_device_id, slaves)
 
     return {
         "success": True,
-        "title": (body.get("title") or "").strip() or (uris[0] if uris else uri),
+        "title": title or (uris[0] if uris else uri),
         "speakers": len(slaves) + 1,
         "play_confirmed": confirmed,
         "uri": uris[0] if uris else uri,
