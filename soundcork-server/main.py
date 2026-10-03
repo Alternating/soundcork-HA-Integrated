@@ -3512,17 +3512,22 @@ async def api_spotify_episodes(id: str):
 async def api_spotify_play(request: Request):
     """Play a Spotify URI on speakers via SPOTIFY CONNECT.
 
-    Body: {uri, title?, image?, master_ip, master_device_id,
+    Body: {uri | uris[], title?, image?, master_ip, master_device_id,
            slaves: [{ip, device_id}]}
 
-    Mechanism (verified on hardware 2026-10-03): after ZeroConf priming,
-    each speaker registers with Spotify's servers as a Connect device whose
-    name matches its SoundTouch name. The Bose /select ContentItem path for
-    SPOTIFY stays INVALID_SOURCE (the source sits UNAVAILABLE); the path
-    that works is a Spotify Web API playback transfer to the speaker's
-    Connect device id. Episode/track URIs go in `uris`, show/album/playlist/
-    artist contexts in `context_uri`. Slaves are then zoned onto the master
-    via Bose /setZone so the group mirrors the master's Spotify audio.
+    Single play: pass `uri`. Series play: pass `uris` -- an ordered list of
+    episode/track URIs that Spotify plays back-to-back in that exact order
+    (native queue behaviour, verified on hardware 2026-10-03), so selection
+    order == play order and continuation is automatic.
+
+    Mechanism: after ZeroConf priming, each speaker registers with Spotify's
+    servers as a Connect device whose name matches its SoundTouch name. The
+    Bose /select ContentItem path for SPOTIFY stays INVALID_SOURCE (the
+    source sits UNAVAILABLE); the path that works is a Spotify Web API
+    playback transfer to the speaker's Connect device id. Episode/track URIs
+    go in `uris`, a single show/album/playlist/artist context in
+    `context_uri`. Slaves are then zoned onto the master via Bose /setZone
+    so the group mirrors the master's Spotify audio.
 
     409s when no Spotify account is linked (nothing primed the speakers).
     """
@@ -3530,11 +3535,21 @@ async def api_spotify_play(request: Request):
 
     body = await request.json()
     uri = (body.get("uri") or "").strip()
+    uris = [u.strip() for u in (body.get("uris") or []) if isinstance(u, str) and u.strip()]
     master_ip = body.get("master_ip", "")
     slaves = body.get("slaves", [])
-    if not master_ip or not uri:
-        raise HTTPException(status_code=400, detail="master_ip and uri are required")
-    if not re.fullmatch(_SPOTIFY_URI_RE, uri):
+    if not master_ip or not (uri or uris):
+        raise HTTPException(status_code=400, detail="master_ip and uri (or uris) are required")
+    # Series play requires episode/track URIs only (context_uri takes one
+    # container; a mixed list isn't a valid Spotify context).
+    if uris:
+        for u in uris:
+            if not re.fullmatch(_SPOTIFY_URI_RE, u) or u.split(":")[1] not in ("episode", "track"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="uris must all be spotify:episode:... or spotify:track:... for series play",
+                )
+    elif not re.fullmatch(_SPOTIFY_URI_RE, uri):
         raise HTTPException(
             status_code=400,
             detail="uri must look like spotify:show:... / spotify:episode:... (track, album, playlist, artist also accepted)",
@@ -3577,8 +3592,11 @@ async def api_spotify_play(request: Request):
                         "It may need re-priming (restart soundcork) or a moment to register."
                     ),
                 )
-            kind = uri.split(":")[1]
-            payload = {"uris": [uri]} if kind in ("episode", "track") else {"context_uri": uri}
+            if uris:
+                payload = {"uris": uris}
+            else:
+                kind = uri.split(":")[1]
+                payload = {"uris": [uri]} if kind in ("episode", "track") else {"context_uri": uri}
             r = await client.put(
                 f"{_SPOTIFY_API}/me/player/play",
                 params={"device_id": device["id"]},
@@ -3596,10 +3614,11 @@ async def api_spotify_play(request: Request):
 
     return {
         "success": True,
-        "title": (body.get("title") or "").strip() or uri,
+        "title": (body.get("title") or "").strip() or (uris[0] if uris else uri),
         "speakers": len(slaves) + 1,
         "play_confirmed": confirmed,
-        "uri": uri,
+        "uri": uris[0] if uris else uri,
+        "queued": len(uris) if uris else 1,
     }
 
 

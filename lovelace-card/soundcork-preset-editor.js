@@ -55,6 +55,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._spShow = null;
     this._spEpisodes = [];
     this._spLoading = false;
+    this._spSelected = []; // episode URIs in checked order (series play)
     this._selectedSpeakers = null; // null means ALL
     this._message = null;
     this._initialized = false;
@@ -654,6 +655,12 @@ class SoundcorkPresetEditor extends HTMLElement {
     .back-btn{background:var(--secondary-background-color,#2a2a40);border:none;cursor:pointer;color:var(--primary-text-color);font-size:16px;padding:8px 12px;border-radius:8px;flex-shrink:0}
     .back-btn:hover{background:rgba(3,169,244,.2)}
     .fav-del{background:none;border:none;cursor:pointer;font-size:14px;color:var(--secondary-text-color);padding:4px 6px;flex-shrink:0;transition:color .15s}
+    .ep-check{flex-shrink:0;width:24px;height:24px;border-radius:6px;border:1.5px solid var(--divider-color,#555);background:transparent;color:#fff;font-size:12px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,border-color .15s}
+    .ep-check:hover{border-color:var(--primary-color)}
+    .ep-check.checked{background:var(--primary-color,#03a9f4);border-color:var(--primary-color,#03a9f4)}
+    .result.ep-selected{background:rgba(3,169,244,.1)}
+    .series-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:8px 10px;margin-bottom:8px;border-radius:8px;background:rgba(3,169,244,.12);font-size:12px;color:var(--primary-text-color)}
+    .series-play{white-space:nowrap}
     .fav-del:hover{color:#ff6b6b}
     .pod-adv{margin-top:12px}
     .pod-adv summary{font-size:11px;color:var(--secondary-text-color);cursor:pointer;margin-bottom:8px}
@@ -1133,24 +1140,50 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   async _spPlay(uri, title, image) {
+    return this._spPlayBody({ uri, title, image: image || '' }, title);
+  }
+
+  // Selection order == play order. _spSelected holds episode URIs in the
+  // order the user checked them; "Play Series" sends them as an ordered
+  // list that Spotify plays back-to-back natively.
+  _spToggleSelect(uri) {
+    if (!this._spSelected) this._spSelected = [];
+    const i = this._spSelected.indexOf(uri);
+    if (i > -1) this._spSelected.splice(i, 1);
+    else this._spSelected.push(uri);
+    this._render();
+  }
+
+  async _spPlaySeries() {
+    const uris = (this._spSelected || []).slice();
+    if (!uris.length) return;
+    const label = `${uris.length} episode${uris.length>1?'s':''} from ${this._spShow ? this._spShow.name : 'selection'}`;
+    const ok = await this._spPlayBody({ uris, title: label }, label);
+    if (ok) { this._spSelected = []; this._render(); }
+  }
+
+  async _spPlayBody(payload, label) {
     const targets = this._getTargetSpeakers();
-    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
+    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return false; }
     this._podcastLoading = true;
-    this._podcastStatus = {type:'loading', msg:`Starting: ${title}...`};
+    this._podcastStatus = {type:'loading', msg:`Starting: ${label}...`};
     this._render();
     const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
-    if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
+    if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return false; }
     const masterIdx = this._pickMasterIdx(reachable);
     const master = reachable[masterIdx], slaves = reachable.filter((_, i) => i !== masterIdx);
+    let ok = false;
     try {
       const r = await fetch(`${this._baseUrl}/api/v1/spotify/play`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ uri, title, image: image || '', master_ip: master.ip, master_device_id: master.device_id, slaves })
+        body: JSON.stringify({ ...payload, master_ip: master.ip, master_device_id: master.device_id, slaves })
       });
       const data = await r.json();
       if (r.ok && data.success) {
+        ok = true;
         const note = data.play_confirmed === false ? ' (speaker has not confirmed playback yet)' : '';
-        this._podcastStatus = {type:'success', msg:`Playing: ${data.title} on ${data.speakers} speaker${data.speakers>1?'s':''}${note}`};
+        const q = data.queued > 1 ? `Playing ${data.queued} episodes in order` : `Playing: ${data.title}`;
+        this._podcastStatus = {type:'success', msg:`${q} on ${data.speakers} speaker${data.speakers>1?'s':''}${note}`};
       } else {
         this._podcastStatus = {type:'error', msg: data.detail || 'Playback failed'};
       }
@@ -1160,6 +1193,7 @@ class SoundcorkPresetEditor extends HTMLElement {
     this._podcastLoading = false;
     this._render();
     setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+    return ok;
   }
 
   _render() {
@@ -1526,24 +1560,36 @@ class SoundcorkPresetEditor extends HTMLElement {
       let bodyHtml;
       if (this._spView === 'episodes' && this._spShow) {
         const fav = this._spIsFavorite(this._spShow.uri);
+        const sel = this._spSelected || [];
         const eps = this._spLoading
           ? '<div class="loading">Loading episodes...</div>'
-          : this._spEpisodes.length ? this._spEpisodes.map((ep, i) => `
-            <div class="result">
+          : this._spEpisodes.length ? this._spEpisodes.map((ep, i) => {
+            const pos = sel.indexOf(ep.uri);
+            return `
+            <div class="result ${pos>-1?'ep-selected':''}">
+              <button class="ep-check ${pos>-1?'checked':''}" data-uri="${this._esc(ep.uri)}" title="Add to series">${pos>-1?(pos+1):''}</button>
               <div class="result-art">${ep.image?`<img src="${this._esc(ep.image)}" alt=""/>`:'<div style="font-size:20px">&#x1F3A7;</div>'}</div>
               <div class="result-info">
                 <div class="result-name">${this._esc(ep.title)}</div>
                 <div class="result-sub">${this._esc(ep.date)}${this._fmtDuration(ep.duration_seconds)?' &middot; '+this._fmtDuration(ep.duration_seconds):''}</div>
               </div>
               <button class="play-btn sp-ep-play" data-i="${i}" ${this._podcastLoading?'disabled':''}>&#x25B6; Play</button>
-            </div>`).join('') : '<div class="empty">No episodes found</div>';
+            </div>`;}).join('') : '<div class="empty">No episodes found</div>';
+        const seriesBar = sel.length ? `<div class="series-bar">
+            <span>${sel.length} selected &middot; plays in checked order</span>
+            <div class="pandora-btns">
+              <button class="play-btn series-clear">Clear</button>
+              <button class="search-btn series-play" ${this._podcastLoading?'disabled':''}>&#x25B6; Play Series (${sel.length})</button>
+            </div>
+          </div>` : '';
         bodyHtml = `
           <div class="ep-header">
             <button class="back-btn" id="sp-back" title="Back to shows">&#x2190;</button>
             <div class="result-art">${this._spShow.image?`<img src="${this._esc(this._spShow.image)}" alt=""/>`:'&#x1F399;'}</div>
-            <div class="result-info"><div class="result-name">${this._esc(this._spShow.name)}</div><div class="result-sub">Newest episodes</div></div>
+            <div class="result-info"><div class="result-name">${this._esc(this._spShow.name)}</div><div class="result-sub">Newest episodes &middot; check to build a series</div></div>
             <button class="fav-btn ${fav?'active':''}" id="sp-fav" title="${fav?'Remove favorite':'Save favorite'}">${fav?'&#x2665;':'&#x2661;'}</button>
           </div>
+          ${seriesBar}
           <div class="results">${eps}</div>`;
       } else {
         const favRows = this._spFavorites.map((f, i) => `
@@ -1608,12 +1654,15 @@ class SoundcorkPresetEditor extends HTMLElement {
         });
       });
       if (this._spView === 'episodes' && this._spShow) {
-        this.shadowRoot.getElementById('sp-back')?.addEventListener('click', () => { this._spView = 'list'; this._spShow = null; this._render(); });
+        this.shadowRoot.getElementById('sp-back')?.addEventListener('click', () => { this._spView = 'list'; this._spShow = null; this._spSelected = []; this._render(); });
         this.shadowRoot.getElementById('sp-fav')?.addEventListener('click', () => this._spToggleFavorite(this._spShow));
         this.shadowRoot.querySelectorAll('.sp-ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._spEpisodes[parseInt(b.dataset.i)];
           if (ep) this._spPlay(ep.uri, `${this._spShow.name}: ${ep.title}`, ep.image || this._spShow.image);
         }));
+        this.shadowRoot.querySelectorAll('.ep-check').forEach(b => b.addEventListener('click', () => this._spToggleSelect(b.dataset.uri)));
+        this.shadowRoot.querySelector('.series-play')?.addEventListener('click', () => this._spPlaySeries());
+        this.shadowRoot.querySelector('.series-clear')?.addEventListener('click', () => { this._spSelected = []; this._render(); });
       } else {
         const si = this.shadowRoot.getElementById('sp-search');
         // Search fires on Enter/button ONLY (commit 1b1c611 lesson: a
