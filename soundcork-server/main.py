@@ -11,7 +11,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi_etag import Etag
 
 from soundcork.admin import get_admin_router
@@ -3256,17 +3256,60 @@ async def api_spotify_link():
     return RedirectResponse(url=_spotify_svc.build_authorize_url(redirect_uri=_SPOTIFY_LOOPBACK_REDIRECT))
 
 
+_SPOTIFY_LINK_PAGE = """<!doctype html><html><head><title>Link Spotify - SoundCork</title>
+<style>body{font-family:sans-serif;background:#1a1a2e;color:#eee;max-width:640px;margin:40px auto;padding:0 16px;line-height:1.6}
+a,button{color:#1db954}input{width:100%;padding:10px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;font-family:monospace}
+button{background:#1db954;color:#000;border:none;border-radius:8px;padding:10px 22px;font-weight:700;cursor:pointer;margin-top:10px}
+.step{background:#23233a;border-radius:10px;padding:14px 18px;margin:12px 0}</style></head><body>
+<h2>Link a Spotify account</h2>
+<p>Spotify only allows this flow through a <code>127.0.0.1</code> address, so the last page will look broken - that's expected.</p>
+<div class="step"><b>Step 1.</b> Make sure this browser is logged in to the <b>Spotify Premium</b> account you want on the speakers, then
+<a href="/api/v1/spotify/link" target="_blank">click here to approve access</a>.</div>
+<div class="step"><b>Step 2.</b> After clicking <b>Agree</b>, you'll land on a dead page at <code>127.0.0.1</code>. Copy its <b>full address</b> from the address bar.</div>
+<div class="step"><b>Step 3.</b> Paste it here and finish:
+<form method="get" action="/api/v1/spotify/link/complete">
+<input name="url" placeholder="http://127.0.0.1:8000/mgmt/spotify/callback?code=..." autocomplete="off"/>
+<button type="submit">Link account</button></form></div>
+</body></html>"""
+
+
 @app.get("/api/v1/spotify/link/complete", tags=["soundcork-api"])
-async def api_spotify_link_complete(code: str):
-    """Finish linking with the ?code= value from the 127.0.0.1 page the
-    browser lands on after the user approves."""
+async def api_spotify_link_complete(code: str = "", url: str = ""):
+    """Guided finish for Spotify account linking.
+
+    With no params: serves the step-by-step page the webui's "+" button
+    opens. With ?url= (the dead 127.0.0.1 address the browser lands on
+    after approving) or ?code=: exchanges the authorization code using
+    the loopback redirect_uri and stores the account.
+    """
     from soundcork.mgmt import spotify as _spotify_svc
 
+    if not code and url:
+        m = re.search(r"[?&]code=([^&\s]+)", url)
+        if not m:
+            return HTMLResponse(
+                "<html><body><h2>No code found in that address</h2>"
+                "<p>It should contain <code>?code=...</code> - go back and copy the full address.</p></body></html>",
+                status_code=400,
+            )
+        code = m.group(1)
+    if not code:
+        return HTMLResponse(_SPOTIFY_LINK_PAGE)
     try:
         account = await _spotify_svc.exchange_code_and_store(code, redirect_uri=_SPOTIFY_LOOPBACK_REDIRECT)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Spotify code exchange failed: {e}")
-    return {"linked": True, "account": account}
+        return HTMLResponse(
+            f"<html><body><h2>Linking failed</h2><p>{_xml_escape(str(e))}</p>"
+            "<p>Authorization codes expire after a few minutes - "
+            '<a href="/api/v1/spotify/link/complete">start over</a>.</p></body></html>',
+            status_code=502,
+        )
+    return HTMLResponse(
+        f"<html><body><h2>Spotify Connected</h2>"
+        f"<p>Linked: {_xml_escape(str(account.get('displayName', '')))} ({_xml_escape(str(account.get('spotifyUserId', '')))})</p>"
+        "<p>The speakers will be provisioned on the next server restart "
+        "(or automatically within 45 minutes). You can close this tab.</p></body></html>"
+    )
 _SPOTIFY_URI_RE = r"spotify:(track|album|playlist|artist|show|episode):[A-Za-z0-9]{22}"
 
 _spotify_cc_token = {"token": None, "expires_at": 0.0}
