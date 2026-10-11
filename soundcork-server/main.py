@@ -2432,6 +2432,7 @@ async def api_zone_clear(ip: str):
 # 2 seconds for a The Daily episode routed this way.
 # ---------------------------------------------------------------------------
 
+import html as _html
 from urllib.parse import quote as _urlquote
 from xml.sax.saxutils import escape as _xml_escape, quoteattr as _xml_quoteattr
 
@@ -2525,7 +2526,8 @@ async def api_tunein_episodes(id: str):
             episodes.append(
                 {
                     "guide_id": child["guide_id"],
-                    "title": child.get("text", ""),
+                    # TuneIn delivers pre-escaped entities ("Ku&apos;s Legacy")
+                    "title": _html.unescape(child.get("text", "")),
                     "date": child.get("subtext", ""),
                     "duration_seconds": child.get("topic_duration"),
                     "image": child.get("image", ""),
@@ -2624,6 +2626,7 @@ def _orion_short_location(name: str, image_url: str, stream_url: str) -> str:
     if len(_scs_store) > _SCS_MAX:  # bounded; drop oldest
         for old in list(_scs_store)[: len(_scs_store) - _SCS_MAX]:
             _scs_store.pop(old, None)
+    _scs_save()
     return f"{settings.base_url}/scs/{key}"
 
 
@@ -2642,6 +2645,32 @@ def soundcork_short_stream(key: str) -> BmxPlaybackResponse:
 # with its audio relayed through this endpoint starting at a byte offset
 # (Range request against the CDN). Keys map to {"upstream", "offset"}.
 _scs_audio: dict[str, dict] = {}
+
+# Persist the key stores: speakers RE-FETCH the /scs/{key} descriptor during
+# playback (observed live 2026-10-11), so a server restart that wiped the
+# in-memory store killed in-flight episodes minutes later with a 404.
+_SCS_PERSIST = os.path.join(settings.data_dir, "scs_store.json")
+
+
+def _scs_save() -> None:
+    try:
+        with open(_SCS_PERSIST, "w") as f:
+            _json.dump({"store": _scs_store, "audio": _scs_audio}, f)
+    except Exception:
+        pass
+
+
+def _scs_load() -> None:
+    try:
+        with open(_SCS_PERSIST, "r") as f:
+            d = _json.load(f)
+        _scs_store.update(d.get("store") or {})
+        _scs_audio.update(d.get("audio") or {})
+    except Exception:
+        pass
+
+
+_scs_load()
 
 
 @app.get("/scs/{key}/audio", tags=["bmx"])
@@ -2696,7 +2725,7 @@ async def _resolve_tunein_stream(guide_id: str) -> tuple:
     raw_url = body_items[0].get("url", "") if body_items else ""
     if not raw_url:
         raise HTTPException(status_code=404, detail=f"No stream found for {guide_id}")
-    title = tune.get("head", {}).get("title", "") or "TuneIn"
+    title = _html.unescape(tune.get("head", {}).get("title", "") or "TuneIn")
     final_url = raw_url
     try:
         async with _httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
@@ -2939,6 +2968,9 @@ async def _play_wrapped_stream(
     """Shared playback pipeline for any provider that yields a direct audio
     URL (TuneIn, Pushkin, iHeart...): optional redirect pre-resolution, orion
     wrap, select on master, confirm PLAY_STATE before zoning slaves."""
+    # some sources (TuneIn, older stored playlist items) carry pre-escaped
+    # entities; unescape so the speaker displays "Ku's" and not "Ku&apos;s"
+    title = _html.unescape(title or "")
     if resolve_redirects:
         try:
             async with _httpx.AsyncClient(
@@ -3098,16 +3130,27 @@ async def _queue_play_current() -> bool:
     return False
 
 
+def _title_match_norm(s: str) -> str:
+    """Normalize a title for switch-verification. Unescape TWICE: TuneIn
+    titles can arrive pre-escaped ("Ku&apos;s"), and the speaker XML-escapes
+    its nowPlaying echo on top ("Ku&amp;apos;s"). A raw-vs-escaped mismatch
+    here caused 3 restart-from-zero "retries" and then a bogus skip for any
+    title with an apostrophe (the Ku's Legacy bug)."""
+    s = _html.unescape(_html.unescape(s or ""))
+    return re.sub(r"\s+", " ", s).strip()[:30]
+
+
 async def _queue_mp3_switched(title: str) -> bool:
     """Poll the master until its itemName matches our orion item's title
-    (the speaker echoes our exact itemName for LOCAL_INTERNET_RADIO)."""
-    want = (title or "")[:30]
+    (the speaker echoes our itemName for LOCAL_INTERNET_RADIO, modulo XML
+    entity escaping -- hence the normalized comparison)."""
+    want = _title_match_norm(title)
     for _ in range(6):
         try:
             async with _httpx.AsyncClient(timeout=_SPEAKER_TIMEOUT) as client:
                 txt = (await client.get(_speaker_url(_q["master_ip"], "/nowPlaying"))).text
             m = re.search(r"<itemName>([^<]*)</itemName>", txt)
-            if m and m.group(1).strip()[:30] == want:
+            if m and _title_match_norm(m.group(1)) == want:
                 return True
         except Exception:
             pass
@@ -3184,7 +3227,7 @@ async def _queue_seek(position_ms: int) -> bool:
     if not total:
         return False
     offset = int(total * position_ms / dur)
-    title = cur.get("title", "")
+    title = _html.unescape(cur.get("title", ""))
     image = cur.get("image", "")
     key = _secrets_mod.token_hex(8)
     payload = _base64.b64encode(_json.dumps({
@@ -3197,6 +3240,7 @@ async def _queue_seek(position_ms: int) -> bool:
         if len(d) > _SCS_MAX:
             for old in list(d)[: len(d) - _SCS_MAX]:
                 d.pop(old, None)
+    _scs_save()
     # Report the target position immediately so state polls during the
     # re-select don't snap the card's bar back to the pre-seek estimate.
     _q["pos_base_ms"] = position_ms
@@ -3398,7 +3442,10 @@ async def api_queue_control(request: Request):
                     except Exception:
                         pass
             return {"success": True, "action": action, "external": True}
-        return {"success": True, "action": action, "note": "no active queue session"}
+        # seek/next/previous need a live session -- report failure honestly so
+        # the card reconciles instead of showing an optimistic jump that never
+        # happened (this masked the Ku's Legacy session-death bug)
+        return {"success": False, "action": action, "note": "no active queue session"}
     cur = _q["current"] or {}
     provider = cur.get("provider") or "spotify"
     async with _q_lock:
