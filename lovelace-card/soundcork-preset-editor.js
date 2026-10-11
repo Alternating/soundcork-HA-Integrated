@@ -685,8 +685,9 @@ class SoundcorkPresetEditor extends HTMLElement {
     .np-meta{flex:1;min-width:0}
     .np-title{font-size:13px;font-weight:700;color:var(--primary-text-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .np-artist{font-size:11px;color:var(--secondary-text-color);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .np-seek{height:8px;border-radius:5px;background:var(--divider-color,#444);cursor:pointer;overflow:hidden}
-    .np-seek-fill{height:100%;background:var(--primary-color,#03a9f4);border-radius:5px;transition:width .25s linear;pointer-events:none}
+    /* native range input, same grabbable circle thumb as the volume bars;
+       touch-action keeps a horizontal thumb-drag from scrolling the page */
+    .np-seek{width:100%;margin:2px 0;cursor:pointer;accent-color:var(--primary-color,#03a9f4);touch-action:none}
     .np-times{display:flex;justify-content:space-between;font-size:10px;color:var(--secondary-text-color);margin:4px 1px 8px}
     .np-controls{display:flex;align-items:center;justify-content:center;gap:18px}
     .np-btn{background:none;border:none;cursor:pointer;color:var(--primary-text-color);font-size:20px;padding:4px 8px;border-radius:6px;transition:color .15s,background .15s}
@@ -1307,7 +1308,7 @@ class SoundcorkPresetEditor extends HTMLElement {
             '<div class="np-art" id="np-art"></div>' +
             '<div class="np-meta"><div class="np-title" id="np-title"></div><div class="np-artist" id="np-artist"></div></div>' +
           '</div>' +
-          '<div class="np-seek" id="np-seek"><div class="np-seek-fill" id="np-seek-fill"></div></div>' +
+          '<input class="np-seek" id="np-seek" type="range" min="0" max="1000" value="0"/>' +
           '<div class="np-times"><span id="np-elapsed"></span><span id="np-total"></span></div>' +
           '<div class="np-controls">' +
             '<button class="np-btn" id="np-prev" title="Previous">&#x23EE;</button>' +
@@ -1318,12 +1319,24 @@ class SoundcorkPresetEditor extends HTMLElement {
       wrap.querySelector('#np-prev').addEventListener('click', () => this._spControl('previous'));
       wrap.querySelector('#np-next').addEventListener('click', () => this._spControl('next'));
       wrap.querySelector('#np-playpause').addEventListener('click', () => this._spControl(this._spNow && this._spNow.playing ? 'pause' : 'play'));
-      wrap.querySelector('#np-seek').addEventListener('click', (e) => {
-        const d = this._spNow && this._spNow.duration_ms; if (!d) return;
-        const rect = e.currentTarget.getBoundingClientRect();
-        const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-        this._spControl('seek', Math.round(frac * d));
+      // native range input = same grabbable thumb as the volume sliders.
+      // _spSeekDragging keeps the 1s tick / 4s poll from yanking the thumb
+      // out from under a finger mid-drag; `change` (on release) seeks.
+      const sk = wrap.querySelector('#np-seek');
+      sk.addEventListener('pointerdown', () => { this._spSeekDragging = true; });
+      sk.addEventListener('input', () => {
+        const d = this._spNow && this._spNow.duration_ms;
+        const el = wrap.querySelector('#np-elapsed');
+        if (d && el) el.textContent = this._fmtClock((sk.value / 1000) * d);
       });
+      sk.addEventListener('change', () => {
+        const d = this._spNow && this._spNow.duration_ms;
+        this._spSeekDragging = false;
+        if (d) this._spControl('seek', Math.round((sk.value / 1000) * d));
+      });
+      // release without a value change fires no `change`; don't stay stuck
+      ['pointerup', 'pointercancel'].forEach(ev =>
+        sk.addEventListener(ev, () => setTimeout(() => { this._spSeekDragging = false; }, 250)));
     }
     wrap.querySelector('#np-art').innerHTML = n.image ? `<img src="${this._esc(n.image)}" alt=""/>` : '&#x1F3A7;';
     wrap.querySelector('#np-title').textContent = n.title;
@@ -1331,10 +1344,11 @@ class SoundcorkPresetEditor extends HTMLElement {
     // seek bar whenever a position is known: Spotify reports its own; MP3
     // items use the server's estimated position + byte-offset seek
     const hasSeek = n.has_seek !== false && n.progress_ms != null;
-    wrap.querySelector('#np-seek').style.display = hasSeek ? '' : 'none';
+    const seekEl = wrap.querySelector('#np-seek');
+    seekEl.style.display = hasSeek ? '' : 'none';
     wrap.querySelector('.np-times').style.display = hasSeek ? '' : 'none';
-    if (hasSeek) {
-      wrap.querySelector('#np-seek-fill').style.width = pct + '%';
+    if (hasSeek && !this._spSeekDragging) {
+      seekEl.value = Math.round(pct * 10);   // 0-1000 scale
       wrap.querySelector('#np-elapsed').textContent = this._fmtClock(pos);
       wrap.querySelector('#np-total').textContent = dur ? this._fmtClock(dur) : '';
     }
