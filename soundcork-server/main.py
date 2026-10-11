@@ -2769,7 +2769,12 @@ async def api_card_js():
     path = "/app/soundcork/card/soundcork-preset-editor.js"
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="card not bundled in this image")
-    return FileResponse(path, media_type="application/javascript")
+    # no-cache (NOT no-store): browsers must revalidate on every page load, so
+    # a hot-swapped card ships on the next reload instead of lingering for days
+    # in some device's heuristic cache (the Hidden Brain no-progress-bar bug).
+    # ETag/Last-Modified make revalidation a cheap 304 when nothing changed.
+    return FileResponse(path, media_type="application/javascript",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.post("/api/v1/tunein/play-podcast", tags=["soundcork-api"])
