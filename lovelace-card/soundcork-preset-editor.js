@@ -902,6 +902,22 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   async _playGuideId(guideId, title, image) {
+    // Podcast shows (p...) resolve their latest episode and play it through
+    // the queue player, so show-level ▶ Play gets the same progress bar as
+    // episode rows. Live stations (s...) keep the one-shot path -- there is
+    // nothing to scrub on live radio. Falls back to legacy on any failure.
+    if (/^p\d+$/.test(guideId)) {
+      this._podcastStatus = {type:'loading', msg:`Finding latest episode of ${title}...`};
+      this._render();
+      try {
+        const data = await (await fetch(`${this._baseUrl}/api/v1/tunein/episodes?id=${encodeURIComponent(guideId)}`, {signal: AbortSignal.timeout(15000)})).json();
+        const ep = (data.episodes || [])[0];
+        if (ep && ep.guide_id) {
+          await this._playEpisodeViaQueue({ provider:'tunein', uri: ep.guide_id, title: ep.title, artist: title || '', image: ep.image || image || '', duration_ms: (ep.duration_seconds||0)*1000 });
+          return;
+        }
+      } catch(e) { /* fall through to the legacy latest-episode path */ }
+    }
     const targets = this._getTargetSpeakers();
     if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
     this._podcastLoading = true;
