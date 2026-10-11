@@ -3321,11 +3321,39 @@ def _queue_ensure_supervisor():
 
 @app.post("/api/v1/queue/play", tags=["soundcork-api"])
 async def api_queue_play(request: Request):
-    """Start playing the queue on speakers. Body: {master_ip,
-    master_device_id, slaves, start_uri?}. Plays from start_uri if given,
-    else from the top, auto-advancing through the rest."""
+    """Start a queue session. Body: {master_ip, master_device_id, slaves,
+    start_uri?, items?}. Without `items` it plays the saved playlist (from
+    start_uri if given). With inline `items` it plays those instead -- used
+    by the tiles' direct Play buttons so a one-off episode still gets the
+    full player (progress bar, seek, pause) without touching the playlist."""
     body = await request.json()
-    items = _load_spotify_playlist()
+    inline = body.get("items")
+    if isinstance(inline, list) and inline:
+        items = []
+        for it in inline:
+            if not isinstance(it, dict):
+                continue
+            provider = (it.get("provider") or "").strip()
+            uri = str(it.get("uri") or "").strip()
+            pattern = _QUEUE_PROVIDER_URI.get(provider)
+            if not pattern or not re.fullmatch(pattern, uri):
+                continue
+            try:
+                dur = int(it.get("duration_ms") or 0)
+            except (TypeError, ValueError):
+                dur = 0
+            items.append({
+                "provider": provider, "uri": uri,
+                "title": str(it.get("title") or "")[:300],
+                "artist": str(it.get("artist") or "")[:200],
+                "image": str(it.get("image") or "")[:1000],
+                "duration_ms": dur,
+                "stream_url": str(it.get("stream_url") or "")[:1000],
+            })
+        if not items:
+            raise HTTPException(status_code=400, detail="no valid items")
+    else:
+        items = _load_spotify_playlist()
     if not items:
         raise HTTPException(status_code=400, detail="queue is empty")
     start = (body.get("start_uri") or "").strip()
@@ -3336,9 +3364,9 @@ async def api_queue_play(request: Request):
             master_ip=body.get("master_ip", ""), master_device_id=body.get("master_device_id", ""),
             slaves=body.get("slaves", []),
         )
-        await _queue_play_from(idx)
+        ok = await _queue_play_from(idx)
     _queue_ensure_supervisor()
-    return {"success": True, "playing_index": idx, "count": len(items)}
+    return {"success": ok, "playing_index": _q["index"], "count": len(items)}
 
 
 @app.post("/api/v1/queue/control", tags=["soundcork-api"])

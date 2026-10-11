@@ -985,7 +985,7 @@ class SoundcorkPresetEditor extends HTMLElement {
       const data = await (await fetch(`${this._baseUrl}/api/v1/pushkin/episodes?show=${encodeURIComponent(slug)}`, {signal: AbortSignal.timeout(25000)})).json();
       const ep = (data.episodes || [])[0];
       if (!ep) throw new Error('No episodes found');
-      await this._playStreamUrl(ep.audio_url, `${(data.show && data.show.name) || show.name}: ${ep.title}`, ep.image || (data.show && data.show.image) || '');
+      await this._playEpisodeViaQueue({ provider:'pushkin', uri: ep.audio_url, stream_url: ep.audio_url, title: ep.title, artist: (data.show && data.show.name) || show.name, image: ep.image || (data.show && data.show.image) || '', duration_ms: (ep.duration_seconds||0)*1000 });
     } catch(e) {
       this._podcastStatus = {type:'error', msg: e.message || 'Could not find episodes'};
       this._render();
@@ -1012,6 +1012,38 @@ class SoundcorkPresetEditor extends HTMLElement {
       if (r.ok && data.success) {
         const note = data.play_confirmed === false ? ' (speaker has not confirmed playback yet)' : '';
         this._podcastStatus = {type:'success', msg:`Playing: ${data.title} on ${data.speakers} speaker${data.speakers>1?'s':''}${note}`};
+      } else {
+        this._podcastStatus = {type:'error', msg: data.detail || 'Playback failed'};
+      }
+    } catch(e) {
+      this._podcastStatus = {type:'error', msg:'Network error - check SoundCork connection'};
+    }
+    this._podcastLoading = false;
+    this._render();
+    setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
+  }
+
+  // Direct ▶ Play for a single episode, routed through the unified queue
+  // player as a one-item session (saved playlist untouched) so it gets the
+  // same progress bar / seek / pause as playlist playback.
+  async _playEpisodeViaQueue(item) {
+    const targets = this._getTargetSpeakers();
+    if (!targets.length) { this._podcastStatus = {type:'error', msg:'No reachable speakers selected'}; this._render(); return; }
+    this._podcastLoading = true;
+    this._podcastStatus = {type:'loading', msg:`Starting: ${item.title}...`};
+    this._render();
+    const reachable = (await Promise.all(targets.map(async t => ({ ...t, up: await this._reachable(t.ip) })))).filter(t => t.up);
+    if (!reachable.length) { this._podcastLoading = false; this._podcastStatus = {type:'error', msg:'No speakers are reachable'}; this._render(); return; }
+    const masterIdx = this._pickMasterIdx(reachable);
+    const master = reachable[masterIdx], slaves = reachable.filter((_, i) => i !== masterIdx);
+    try {
+      const r = await fetch(`${this._baseUrl}/api/v1/queue/play`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ items: [item], master_ip: master.ip, master_device_id: master.device_id, slaves })
+      });
+      const data = await r.json();
+      if (r.ok && data.success) {
+        this._podcastStatus = {type:'success', msg:`Playing: ${item.title} - controls are in Now Playing`};
       } else {
         this._podcastStatus = {type:'error', msg: data.detail || 'Playback failed'};
       }
@@ -1106,18 +1138,8 @@ class SoundcorkPresetEditor extends HTMLElement {
   }
 
   async _ihPlayEpisode(ep, showName, showImage) {
-    this._podcastStatus = {type:'loading', msg:`Resolving: ${ep.title}...`};
-    this._render();
-    try {
-      const r = await fetch(`${this._baseUrl}/api/v1/iheart/episode-stream?id=${encodeURIComponent(ep.episode_id)}`, {signal: AbortSignal.timeout(15000)});
-      const data = await r.json();
-      if (!r.ok || !data.stream_url) throw new Error(data.detail || 'Could not resolve episode stream');
-      await this._playStreamUrl(data.stream_url, `${showName}: ${ep.title}`, ep.image || data.image || showImage || '');
-    } catch(e) {
-      this._podcastStatus = {type:'error', msg: e.message || 'Could not resolve episode'};
-      this._render();
-      setTimeout(() => { if (this._podcastStatus) { this._podcastStatus = null; this._render(); } }, 8000);
-    }
+    // the queue engine resolves the iHeart stream itself - no pre-resolve hop
+    await this._playEpisodeViaQueue({ provider:'iheart', uri: String(ep.episode_id), title: ep.title, artist: showName || '', image: ep.image || showImage || '', duration_ms: (ep.duration_seconds||0)*1000 });
   }
 
   async _ihPlayLatest(show) {
@@ -1623,7 +1645,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         }));
         this.shadowRoot.querySelectorAll('.ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._podcastEpisodes[parseInt(b.dataset.i)];
-          if (ep) this._playGuideId(ep.guide_id, ep.title, ep.image || this._podcastShow.image);
+          if (ep) this._playEpisodeViaQueue({ provider:'tunein', uri: ep.guide_id, title: ep.title, artist: (this._podcastShow && this._podcastShow.name) || '', image: ep.image || (this._podcastShow && this._podcastShow.image) || '', duration_ms: (ep.duration_seconds||0)*1000 });
         }));
       } else {
         const favUrl = this.shadowRoot.getElementById('fav-url');
@@ -1731,7 +1753,7 @@ class SoundcorkPresetEditor extends HTMLElement {
         }));
         this.shadowRoot.querySelectorAll('.pk-ep-play').forEach(b => b.addEventListener('click', () => {
           const ep = this._pkEpisodes[parseInt(b.dataset.i)];
-          if (ep) this._playStreamUrl(ep.audio_url, `${this._pkShow.name}: ${ep.title}`, ep.image || this._pkShow.image);
+          if (ep) this._playEpisodeViaQueue({ provider:'pushkin', uri: ep.audio_url, stream_url: ep.audio_url, title: ep.title, artist: (this._pkShow && this._pkShow.name) || '', image: ep.image || (this._pkShow && this._pkShow.image) || '', duration_ms: (ep.duration_seconds||0)*1000 });
         }));
       } else {
         const pf = this.shadowRoot.getElementById('pk-filter');
