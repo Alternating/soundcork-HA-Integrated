@@ -1290,7 +1290,8 @@ class SoundcorkPresetEditor extends HTMLElement {
     wrap.querySelector('#np-art').innerHTML = n.image ? `<img src="${this._esc(n.image)}" alt=""/>` : '&#x1F3A7;';
     wrap.querySelector('#np-title').textContent = n.title;
     wrap.querySelector('#np-artist').textContent = n.artist || '';
-    // seek bar only when the source reports a position (Spotify); MP3 has none
+    // seek bar whenever a position is known: Spotify reports its own; MP3
+    // items use the server's estimated position + byte-offset seek
     const hasSeek = n.has_seek !== false && n.progress_ms != null;
     wrap.querySelector('#np-seek').style.display = hasSeek ? '' : 'none';
     wrap.querySelector('.np-times').style.display = hasSeek ? '' : 'none';
@@ -1337,20 +1338,15 @@ class SoundcorkPresetEditor extends HTMLElement {
       this._spUpdateNowBar();
     }
     try {
-      if (action === 'seek') {
-        // seek is Spotify-only (MP3 sources have no scrub); hits the spotify API directly
-        await fetch(`${this._baseUrl}/api/v1/spotify/control`, {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ action: 'seek', position_ms: positionMs })
-        });
-      } else {
-        // play/pause/next/previous go through the unified queue player
-        await fetch(`${this._baseUrl}/api/v1/queue/control`, {
-          method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action })
-        });
-      }
+      // all transport (incl. seek) goes through the unified queue player;
+      // the server dispatches seek per provider (Spotify API vs MP3 byte-
+      // offset re-select through the soundcork relay)
+      await fetch(`${this._baseUrl}/api/v1/queue/control`, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(action === 'seek' ? { action, position_ms: positionMs } : { action })
+      });
     } catch(e) { /* next poll reconciles */ }
-    setTimeout(() => this._spRefreshNow(), action === 'seek' ? 400 : 1200);
+    setTimeout(() => this._spRefreshNow(), action === 'seek' ? 800 : 1200);
   }
 
   async _spRefreshNow() {
@@ -1368,12 +1364,12 @@ class SoundcorkPresetEditor extends HTMLElement {
     if (!cur) return { playing: false };   // nothing playing anywhere
     return {
       playing: !!st.playing,
-      progress_ms: st.position_ms,          // null for MP3 / external
+      progress_ms: st.position_ms,          // null only for external / unknown-duration
       duration_ms: cur.duration_ms || 0,
       title: cur.title || '',
       artist: cur.artist || '',
       image: cur.image || '',
-      has_seek: st.position_ms != null,     // only Spotify exposes a position
+      has_seek: st.position_ms != null,     // Spotify reports; MP3 estimated server-side
       external: !!st.external,              // playing outside the queue (e.g. a preset)
     };
   }

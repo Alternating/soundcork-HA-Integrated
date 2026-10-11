@@ -11,7 +11,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi_etag import Etag
 
 from soundcork.admin import get_admin_router
@@ -2637,6 +2637,48 @@ def soundcork_short_stream(key: str) -> BmxPlaybackResponse:
     return play_custom_stream(payload)
 
 
+# Seek support for MP3 episodes: the speaker gives no position feedback and no
+# native seek for LOCAL_INTERNET_RADIO, so seeking re-selects the same episode
+# with its audio relayed through this endpoint starting at a byte offset
+# (Range request against the CDN). Keys map to {"upstream", "offset"}.
+_scs_audio: dict[str, dict] = {}
+
+
+@app.get("/scs/{key}/audio", tags=["bmx"])
+async def soundcork_short_stream_audio(key: str):
+    ent = _scs_audio.get(key)
+    if not ent:
+        raise HTTPException(status_code=404, detail="unknown audio key")
+    offset = int(ent.get("offset") or 0)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if offset > 0:
+        headers["Range"] = f"bytes={offset}-"
+    client = _httpx.AsyncClient(follow_redirects=True, headers=headers,
+                                timeout=_httpx.Timeout(20.0, read=60.0))
+    try:
+        upstream = await client.send(client.build_request("GET", ent["upstream"]), stream=True)
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"upstream fetch failed: {e}")
+    skip = offset if (offset > 0 and upstream.status_code == 200) else 0  # Range ignored -> discard manually
+
+    async def gen(skip_bytes: int):
+        try:
+            async for chunk in upstream.aiter_bytes(65536):
+                if skip_bytes > 0:
+                    if len(chunk) <= skip_bytes:
+                        skip_bytes -= len(chunk)
+                        continue
+                    chunk = chunk[skip_bytes:]
+                    skip_bytes = 0
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(gen(skip), media_type=upstream.headers.get("content-type", "audio/mpeg"))
+
+
 async def _resolve_tunein_stream(guide_id: str) -> tuple:
     """guide_id (t.../s...) -> (final stream URL, title).
 
@@ -2966,7 +3008,9 @@ _q = {
     "master_ip": "",
     "master_device_id": "",
     "slaves": [],
-    "started_at": 0.0,
+    "started_at": 0.0,      # loop-time when the current play/resume/seek began
+    "pos_base_ms": 0,       # position at that moment (MP3 position estimate base)
+    "stream_url": "",       # resolved audio URL of the current MP3 item (for seek)
     "current": None,
     "supervisor": None,
 }
@@ -3002,6 +3046,8 @@ async def _queue_play_current() -> bool:
     _q["current"] = item
     _q["paused"] = False
     _q["started_at"] = asyncio.get_event_loop().time()
+    _q["pos_base_ms"] = 0
+    _q["stream_url"] = ""
     provider = item.get("provider") or "spotify"
     # Resolve the MP3 stream once; retry only the speaker play step, since a
     # /select timeout mid-transition is usually transient (speaker busy).
@@ -3025,7 +3071,7 @@ async def _queue_play_current() -> bool:
                     item["uri"], [], title, _q["master_ip"], _q["master_device_id"], _q["slaves"]
                 )
                 return True
-            await _play_wrapped_stream(
+            res = await _play_wrapped_stream(
                 stream, title, item.get("image", ""),
                 _q["master_ip"], _q["master_device_id"], _q["slaves"], resolve_redirects=True,
             )
@@ -3034,6 +3080,8 @@ async def _queue_play_current() -> bool:
             # LOCAL_INTERNET_RADIO, and _confirm_play_and_zone only checks for
             # any PLAY_STATE, so without this a stuck old item reads as success.
             if await _queue_mp3_switched(title):
+                _q["stream_url"] = res.get("stream_url") or stream  # final URL, for seek
+                _q["started_at"] = asyncio.get_event_loop().time()  # position clock starts now
                 return True
             last_err = "master did not switch to this item"
         except Exception as e:
@@ -3060,6 +3108,108 @@ async def _queue_mp3_switched(title: str) -> bool:
             pass
         await asyncio.sleep(1.5)
     return False
+
+
+def _queue_position_ms() -> int:
+    """Estimated position of the current MP3 item (UNCLAMPED -- the finished
+    backstop compares it against duration). The speaker reports no position
+    for LOCAL_INTERNET_RADIO, so this is server-side bookkeeping: position at
+    the last play/resume/seek plus wall-clock since (frozen while paused)."""
+    pos = int(_q.get("pos_base_ms") or 0)
+    if not _q["paused"]:
+        pos += int((asyncio.get_event_loop().time() - _q["started_at"]) * 1000)
+    return max(0, pos)
+
+
+async def _stream_total_bytes(url: str) -> int:
+    """Total byte length of a finite audio URL (Range probe, HEAD fallback)."""
+    try:
+        async with _httpx.AsyncClient(follow_redirects=True, timeout=12.0,
+                                      headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(url, headers={"Range": "bytes=0-1"})
+            cr = r.headers.get("content-range", "")
+            if "/" in cr and cr.split("/")[-1].isdigit():
+                return int(cr.split("/")[-1])
+            if r.status_code == 200:
+                return int(r.headers.get("content-length") or 0)
+            h = await client.head(url)
+            return int(h.headers.get("content-length") or 0)
+    except Exception:
+        return 0
+
+
+async def _queue_seek(position_ms: int) -> bool:
+    """Jump the current item to position_ms. Spotify seeks via its API; MP3
+    items re-select the same episode with audio relayed through /scs/.../audio
+    from the proportional byte offset (CBR approximation -- plenty close for
+    a podcast scrub bar)."""
+    cur = _q["current"]
+    if not (_q["active"] and cur):
+        return False
+    provider = cur.get("provider") or "spotify"
+    if provider == "spotify":
+        try:
+            token = await _spotify_token_or_503()
+            async with _httpx.AsyncClient(timeout=8.0) as client:
+                await client.put(f"{_SPOTIFY_API}/me/player/seek",
+                                 params={"position_ms": int(position_ms)},
+                                 headers={"Authorization": f"Bearer {token}"})
+            return True
+        except Exception:
+            return False
+    dur = cur.get("duration_ms") or 0
+    upstream = _q.get("stream_url") or ""
+    if not dur or not upstream:
+        return False
+    position_ms = max(0, min(int(position_ms), dur - 2000 if dur > 2000 else 0))
+    total = await _stream_total_bytes(upstream)
+    if not total:  # URL may have gone stale (session-bound CDNs) - re-resolve once
+        try:
+            async with _httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                fresh = await _queue_resolve_stream(cur, client)
+            if fresh:
+                async with _httpx.AsyncClient(follow_redirects=True, timeout=15.0,
+                                              headers={"User-Agent": "Mozilla/5.0"}) as client:
+                    async with client.stream("GET", fresh) as resp:
+                        upstream = str(resp.url)
+                _q["stream_url"] = upstream
+                total = await _stream_total_bytes(upstream)
+        except Exception:
+            pass
+    if not total:
+        return False
+    offset = int(total * position_ms / dur)
+    title = cur.get("title", "")
+    image = cur.get("image", "")
+    key = _secrets_mod.token_hex(8)
+    payload = _base64.b64encode(_json.dumps({
+        "name": title, "imageUrl": image,
+        "streamUrl": f"{settings.base_url}/scs/{key}/audio",
+    }).encode()).decode()
+    _scs_store[key] = payload
+    _scs_audio[key] = {"upstream": upstream, "offset": offset}
+    for d in (_scs_store, _scs_audio):
+        if len(d) > _SCS_MAX:
+            for old in list(d)[: len(d) - _SCS_MAX]:
+                d.pop(old, None)
+    # Report the target position immediately so state polls during the
+    # re-select don't snap the card's bar back to the pre-seek estimate.
+    _q["pos_base_ms"] = position_ms
+    _q["started_at"] = asyncio.get_event_loop().time()
+    _q["paused"] = False  # a re-select starts playback
+    xml = (
+        f'<ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" '
+        f'location={_xml_quoteattr(f"{settings.base_url}/scs/{key}")} isPresetable="false">'
+        f"<itemName>{_xml_escape(title)}</itemName>"
+        f"<containerArt>{_xml_escape(image)}</containerArt>"
+        f"</ContentItem>"
+    )
+    try:
+        await _select_confirm_zone(xml, _q["master_ip"], _q["master_device_id"], _q["slaves"])
+        return True
+    except Exception as e:
+        logger.warning("queue seek: re-select failed: %s", getattr(e, "detail", None) or e)
+        return False
 
 
 async def _queue_play_from(index: int) -> bool:
@@ -3110,8 +3260,9 @@ async def _queue_item_finished(item: dict) -> bool:
             txt = np.text
             if "PLAY_STATE" not in txt and "BUFFERING_STATE" not in txt:
                 return True  # stopped and we didn't pause -> ended
-            # duration backstop (no position feedback for LOCAL_INTERNET_RADIO)
-            if dur and (asyncio.get_event_loop().time() - _q["started_at"]) * 1000 >= dur + 15000:
+            # duration backstop (no position feedback for LOCAL_INTERNET_RADIO);
+            # position-based so it stays correct across seeks
+            if dur and _queue_position_ms() >= dur + 15000:
                 return True
             return False
     except Exception:
@@ -3193,8 +3344,9 @@ async def api_queue_play(request: Request):
 @app.post("/api/v1/queue/control", tags=["soundcork-api"])
 async def api_queue_control(request: Request):
     """Transport for the active queue session. Body: {action: play|pause|
-    next|previous|stop}."""
-    action = ((await request.json()).get("action") or "").strip()
+    next|previous|stop|seek, position_ms? (seek)}."""
+    body = await request.json()
+    action = (body.get("action") or "").strip()
     if not _q["active"]:
         # No queue session: play/pause acts globally on whatever is actually
         # playing (e.g. a radio preset) by toggling every playing speaker;
@@ -3218,9 +3370,11 @@ async def api_queue_control(request: Request):
     provider = cur.get("provider") or "spotify"
     async with _q_lock:
         if action == "pause":
+            _q["pos_base_ms"] = _queue_position_ms()  # freeze the MP3 position clock
             _q["paused"] = True
             await _queue_pause_resume(provider, pause=True)
         elif action == "play":
+            _q["started_at"] = asyncio.get_event_loop().time()  # resume the clock
             _q["paused"] = False
             await _queue_pause_resume(provider, pause=False)
         elif action == "next":
@@ -3228,12 +3382,15 @@ async def api_queue_control(request: Request):
                 await _queue_play_from(_q["index"] + 1)
         elif action == "previous":
             await _queue_play_from(max(0, _q["index"] - 1))
+        elif action == "seek":
+            ok = await _queue_seek(int(body.get("position_ms") or 0))
+            return {"success": ok, "action": action, "index": _q["index"]}
         elif action == "stop":
             _q["active"] = False
             _q["current"] = None
             await _queue_pause_resume(provider, pause=True)
         else:
-            raise HTTPException(status_code=400, detail="action must be play|pause|next|previous|stop")
+            raise HTTPException(status_code=400, detail="action must be play|pause|next|previous|stop|seek")
     return {"success": True, "action": action, "index": _q["index"]}
 
 
@@ -3300,6 +3457,10 @@ async def api_queue_state():
                     position_ms = r.json().get("progress_ms")
             except Exception:
                 pass
+        elif cur.get("duration_ms"):
+            # MP3 providers: server-side estimate (speaker reports nothing);
+            # only offered when a duration exists for the bar to scale against
+            position_ms = min(_queue_position_ms(), cur["duration_ms"])
         return {
             "active": True, "external": False, "paused": _q["paused"],
             "index": _q["index"], "count": len(_q["items"]), "current": cur,
